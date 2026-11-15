@@ -2774,9 +2774,6 @@ step:
 - The two M4 follow-ups: bounded layout retention and bulk card
   expansion, after the public benchmark baseline.
 - Mac system-cold timing, deferred by decision.
-- The `dependencies` CI job fails on RUSTSEC-2026-0486 until `rustix`
-  is 1.1.6 or newer. `cargo update -p rustix` is the fix. CI ran again
-  on 2026-11-15.
 - The open Dependabot pull requests, #23 to #28. The `base64` 0.23 and `criterion` 0.8
   bumps can need code changes. Each one needs a completed body before
   merge; see [`ci.md`](ci.md).

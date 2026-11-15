@@ -84,7 +84,7 @@ current.
   wording, unless a plan doc names that output as contract.
 - Declare contract growth in every pull request body, under a
   `Contract growth` heading. The load-bearing contracts:
-  1. The provider trait.
+  1. The provider trait and the judge trait.
   2. Engine events.
   3. Tool names and input schemas.
   4. Config keys.

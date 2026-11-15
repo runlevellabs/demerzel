@@ -25,6 +25,13 @@
 //! It reads the system clock and starts a monotonic timer at each
 //! boundary — the request send, the tool run, the user turn — and the
 //! usage, tool, and turn records carry the start and the wall time.
+//!
+//! An optional [`LoopHost`] sees four loop events: the turn's start,
+//! each known tool call after the policy's decision, each call that
+//! ran, and the turn's end after its turn record. At a tool call the
+//! host can change the decision within fixed limits; see
+//! [`crate::LoopHost`]. Without a host the engine takes one branch per
+//! event and does nothing else.
 
 use std::collections::HashMap;
 use std::future::poll_fn;
@@ -34,6 +41,9 @@ use std::time::{Duration, Instant, SystemTime};
 use serde_json::Value;
 
 use crate::approval::{ApprovalDecision, ApprovalMode, ApprovalPolicy, ApprovalRequest};
+use crate::host::{
+    LoopHost, ToolAfter, ToolBefore, TurnEnd, TurnEndOutcome, TurnStart, TurnView, constrain,
+};
 use crate::message::{ContentBlock, Message, Role, StopReason, Usage};
 use crate::provider::{Effort, Provider, ProviderError, Request, StreamEvent};
 use crate::route::{ProviderHost, Route, Target};
@@ -251,6 +261,10 @@ pub struct EngineParts<'a> {
     /// The history the session continues: a resumed session's
     /// replayed messages. Empty for a fresh session.
     pub history: Vec<Message>,
+    /// The loop seam: sees each loop event and can change a tool
+    /// call's approval within the engine's limits. `None`: the engine
+    /// does no host work.
+    pub host: Option<Box<dyn LoopHost + 'a>>,
 }
 
 impl<'a> EngineParts<'a> {
@@ -269,6 +283,7 @@ impl<'a> EngineParts<'a> {
             config,
             session,
             history: Vec::new(),
+            host: None,
         }
     }
 }
@@ -285,6 +300,10 @@ pub struct Engine<'a> {
     /// the tool set holds between switches, and the snapshot keeps
     /// the request tools block byte-identical across model calls.
     tool_definitions: Vec<ToolDefinition>,
+    host: Option<Box<dyn LoopHost + 'a>>,
+    /// The history index of the current turn's user message: the
+    /// host's view of the turn starts there.
+    turn_start: usize,
 }
 
 impl<'a> Engine<'a> {
@@ -299,6 +318,8 @@ impl<'a> Engine<'a> {
             config: parts.config,
             session: parts.session,
             history: parts.history,
+            host: parts.host,
+            turn_start: 0,
         }
     }
 
@@ -378,6 +399,10 @@ impl<'a> Engine<'a> {
     /// and surfaces on the next append. The message is cut at
     /// `MAX_TURN_ERROR_BYTES`, 1 KiB. A session failure writes no
     /// record; the file is the failure.
+    ///
+    /// The host sees the turn's end after the record: an outcome, or
+    /// `error` for a provider failure. A session failure and a
+    /// dropped turn do not reach it.
     pub async fn user_turn(
         &mut self,
         text: String,
@@ -388,7 +413,8 @@ impl<'a> Engine<'a> {
         let started = Instant::now();
         let result = self.run_turn(text, sink, approver).await;
         let timing = Timing::new(at, started.elapsed());
-        match &result {
+        // The outcome the host sees at turn end, after the record.
+        let ended = match &result {
             // The record first, the line second: a line that says
             // completed must not stand over a file that does not.
             Ok(outcome) => {
@@ -404,6 +430,7 @@ impl<'a> Engine<'a> {
                     outcome.as_str(),
                     timing.duration_ms()
                 );
+                Some(TurnEndOutcome::Outcome(*outcome))
             }
             Err(EngineError::Provider(error)) => {
                 let message = error.to_string();
@@ -417,15 +444,35 @@ impl<'a> Engine<'a> {
                     Some(capped(&message, MAX_TURN_ERROR_BYTES)),
                     timing,
                 );
+                Some(TurnEndOutcome::ProviderError)
             }
             Err(EngineError::Session(error)) => {
                 log::error!(
                     "turn error duration_ms={} session={error}",
                     timing.duration_ms()
                 );
+                None
             }
+        };
+        if let Some(host) = &self.host
+            && let Some(outcome) = ended
+        {
+            let event = TurnEnd {
+                outcome,
+                turn: self.turn_view(&[]),
+            };
+            host.turn_end(&event).await;
         }
         result
+    }
+
+    /// The host's view of the current turn, with `answered` the
+    /// results of the running batch.
+    fn turn_view<'s>(&'s self, answered: &'s [ContentBlock]) -> TurnView<'s> {
+        TurnView::new(
+            self.history.get(self.turn_start..).unwrap_or_default(),
+            answered,
+        )
     }
 
     async fn run_turn(
@@ -434,6 +481,10 @@ impl<'a> Engine<'a> {
         sink: &dyn EventSink,
         approver: &mut dyn Approver,
     ) -> Result<TurnOutcome, EngineError> {
+        if let Some(host) = &self.host {
+            host.turn_start(&TurnStart { prompt: &text }).await;
+        }
+        self.turn_start = self.history.len();
         // Repair results ride in front of the user text, inside one
         // message, so roles keep alternating and the wire order stays
         // results-then-text.
@@ -797,18 +848,25 @@ impl<'a> Engine<'a> {
     /// and one [`ToolCall`] per result for the session's tool
     /// records. On an abort, the refused call and every later call
     /// get error results, so nothing dangles.
+    ///
+    /// The host sees each known call after the policy decides and
+    /// before the user is asked; the approver, the approval record,
+    /// and a grant use the decision that stands after the host. The
+    /// host sees each call that ran before its end event.
     async fn run_tools(
         &mut self,
         message: &Message,
         sink: &dyn EventSink,
         approver: &mut dyn Approver,
     ) -> Result<ToolBatch, EngineError> {
-        let calls: Vec<(String, String, Value)> = message
+        // The input stays borrowed from the message: a call that runs
+        // takes its own copy, and the host sees the original.
+        let calls: Vec<(String, String, &Value)> = message
             .content
             .iter()
             .filter_map(|block| match block {
                 ContentBlock::ToolUse { id, name, input } => {
-                    Some((id.clone(), name.clone(), input.clone()))
+                    Some((id.clone(), name.clone(), input))
                 }
                 _ => None,
             })
@@ -835,22 +893,46 @@ impl<'a> Engine<'a> {
             sink.event(EngineEvent::ToolRun {
                 id: &id,
                 name: &name,
-                input: &input,
+                input,
             });
             // Decide first, then run on the clock: the wait at an
             // approval prompt is the user's time, not the tool's.
-            let verdict = match self.tools.access(&name) {
+            let access = self.tools.access(&name);
+            let verdict = match access {
                 None => Verdict::Run,
                 Some(access) => {
-                    let decision = self.policy.decide(&ApprovalRequest {
+                    let mut decision = self.policy.decide(&ApprovalRequest {
                         tool: &name,
                         access,
-                        input: &input,
+                        input,
                     });
+                    if let Some(host) = &self.host {
+                        let event = ToolBefore {
+                            call_id: &id,
+                            tool: &name,
+                            input,
+                            access,
+                            mode: self.policy.mode,
+                            decision,
+                            turn: self.turn_view(&batch.results),
+                        };
+                        let asked = host.tool_before(&event).await.decision;
+                        let kept = constrain(decision, asked);
+                        if kept != asked {
+                            log::warn!(
+                                "approval {name} call_id={id}: the host asked for {} over {}; \
+                                 the engine keeps {}",
+                                asked.as_str(),
+                                decision.as_str(),
+                                kept.as_str()
+                            );
+                        }
+                        decision = kept;
+                    }
                     let answer = match decision {
                         ApprovalDecision::Allow => ApprovalAnswer::Allow,
                         ApprovalDecision::Deny => ApprovalAnswer::Deny,
-                        ApprovalDecision::AskUser => approver.approve(&name, &input).await,
+                        ApprovalDecision::AskUser => approver.approve(&name, input).await,
                     };
                     let approved = matches!(
                         answer,
@@ -881,7 +963,7 @@ impl<'a> Engine<'a> {
                         self.policy.grant(&ApprovalRequest {
                             tool: &name,
                             access,
-                            input: &input,
+                            input,
                         });
                     }
                     if approved {
@@ -900,13 +982,25 @@ impl<'a> Engine<'a> {
                     }
                 }
             };
+            let ran = matches!(verdict, Verdict::Run);
             let at = SystemTime::now();
             let started = Instant::now();
             let output = match verdict {
-                Verdict::Run => self.tools.run_approved(&name, input).await,
+                Verdict::Run => self.tools.run_approved(&name, input.clone()).await,
                 Verdict::Refuse(message) => ToolOutput::error(message),
             };
             let timing = Timing::new(at, started.elapsed());
+            if ran && let Some(host) = &self.host {
+                let event = ToolAfter {
+                    call_id: &id,
+                    tool: &name,
+                    input,
+                    access,
+                    output: &output,
+                    turn: self.turn_view(&batch.results),
+                };
+                host.tool_after(&event).await;
+            }
             // The summary carries the tool's own outcome line — for
             // bash, the exit code.
             log::info!(
@@ -2798,6 +2892,448 @@ mod tests {
         for request in &requests {
             let text = serde_json::to_string(&request.messages).unwrap();
             assert!(!text.contains("approval"));
+        }
+    }
+
+    use crate::host::{HostReply, ToolGate};
+
+    /// Records each host event as one line, in order. At `tool_before`
+    /// it asks for `gate`, or keeps the policy's decision. At turn end
+    /// it counts the turn records already in the session file.
+    struct RecordingHost<'r> {
+        log: &'r Mutex<Vec<String>>,
+        gate: Option<ApprovalDecision>,
+        path: std::path::PathBuf,
+    }
+
+    impl RecordingHost<'_> {
+        fn push(&self, line: String) {
+            self.log.lock().unwrap().push(line);
+        }
+    }
+
+    /// The calls a view holds: `id:name:ok` or `id:name:error`.
+    fn seen(turn: &TurnView<'_>) -> String {
+        turn.calls()
+            .map(|call| {
+                let status = if call.is_error { "error" } else { "ok" };
+                format!("{}:{}:{status}", call.id, call.name)
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    impl LoopHost for RecordingHost<'_> {
+        fn turn_start<'a>(&'a self, event: &'a TurnStart<'a>) -> BoxFuture<'a, HostReply> {
+            self.push(format!("turn_start {}", event.prompt));
+            Box::pin(std::future::ready(HostReply::default()))
+        }
+
+        fn tool_before<'a>(&'a self, event: &'a ToolBefore<'a>) -> BoxFuture<'a, ToolGate> {
+            self.push(format!(
+                "tool_before {} {} {:?} {} {} prompt={} calls={}",
+                event.call_id,
+                event.tool,
+                event.access,
+                event.mode,
+                event.decision.as_str(),
+                event.turn.prompt(),
+                seen(&event.turn)
+            ));
+            let decision = self.gate.unwrap_or(event.decision);
+            Box::pin(std::future::ready(ToolGate::keep(decision)))
+        }
+
+        fn tool_after(&self, event: &ToolAfter<'_>) -> BoxFuture<'static, HostReply> {
+            self.push(format!(
+                "tool_after {} {} {:?} input={} error={} calls={}",
+                event.call_id,
+                event.tool,
+                event.access,
+                event.input,
+                event.output.is_error,
+                seen(&event.turn)
+            ));
+            Box::pin(std::future::ready(HostReply::default()))
+        }
+
+        fn turn_end(&self, event: &TurnEnd<'_>) -> BoxFuture<'static, HostReply> {
+            let raw = std::fs::read_to_string(&self.path).unwrap();
+            let records = raw
+                .lines()
+                .filter(|line| line.contains("\"type\":\"turn\""))
+                .count();
+            self.push(format!(
+                "turn_end {} prompt={} calls={} final={:?} turn_records={records}",
+                event.outcome.as_str(),
+                event.turn.prompt(),
+                seen(&event.turn),
+                event.turn.final_text()
+            ));
+            Box::pin(std::future::ready(HostReply::default()))
+        }
+    }
+
+    fn hosted_engine<'a>(
+        provider: &'a ScriptedProvider,
+        tools: &'a FakeTools,
+        mode: ApprovalMode,
+        session: Session,
+        host: Option<Box<dyn LoopHost + 'a>>,
+    ) -> Engine<'a> {
+        let mut parts = EngineParts::new(
+            provider,
+            tools,
+            ApprovalPolicy::new(mode),
+            EngineConfig::new(route("test-model")),
+            session,
+        );
+        parts.host = host;
+        Engine::new(parts)
+    }
+
+    /// One batch of four calls: a read-only one, a write the user
+    /// allows, an execute the user declines, and an unknown name.
+    fn mixed_batch() -> Vec<StreamEvent> {
+        let mut events = Vec::new();
+        for (id, name) in [
+            ("c1", "note"),
+            ("c2", "write"),
+            ("c3", "exec"),
+            ("c4", "nope"),
+        ] {
+            events.push(StreamEvent::ToolCallStart {
+                id: id.into(),
+                name: name.into(),
+            });
+            events.push(StreamEvent::ToolCallEnd {
+                id: id.into(),
+                input: json!({"call": id}),
+            });
+        }
+        events.push(StreamEvent::Done(StopReason::ToolUse));
+        events
+    }
+
+    /// Two turns in ask mode, the first with [`mixed_batch`], in a
+    /// fresh session under `dir`. Returns the bytes of each model
+    /// request, every display event, the history, and the session
+    /// records without their clock fields.
+    fn scripted_run<'h>(
+        dir: &tempfile::TempDir,
+        host: impl FnOnce(std::path::PathBuf) -> Option<Box<dyn LoopHost + 'h>>,
+    ) -> (Vec<Vec<u8>>, Vec<String>, Vec<Message>, Vec<Value>) {
+        let provider =
+            ScriptedProvider::new(vec![mixed_batch(), text_done("done"), text_done("bye")]);
+        let tools = FakeTools;
+        let session = session_in(dir);
+        let host = host(session.path().to_path_buf());
+        let mut engine = hosted_engine(&provider, &tools, ApprovalMode::Ask, session, host);
+        let events = Mutex::new(Vec::new());
+        let sink = |event: EngineEvent<'_>| events.lock().unwrap().push(format!("{event:?}"));
+        let mut approver = ScriptedApprover(VecDeque::from([
+            ApprovalAnswer::Allow,
+            ApprovalAnswer::Deny,
+        ]));
+        block_on(engine.user_turn("go".into(), &sink, &mut approver)).unwrap();
+        block_on(engine.user_turn("again".into(), &sink, &mut approver)).unwrap();
+
+        let requests = provider
+            .requests()
+            .iter()
+            .map(|request| {
+                serde_json::to_vec(&json!({
+                    "model": request.model,
+                    "system": request.system_prompt,
+                    "messages": request.messages,
+                    "tools": request.tools,
+                    "max_output_tokens": request.max_output_tokens,
+                    "effort": request.effort,
+                }))
+                .unwrap()
+            })
+            .collect();
+        let mut records = records(&engine);
+        for record in &mut records {
+            let object = record.as_object_mut().unwrap();
+            for clock in ["at", "duration_ms", "created"] {
+                object.remove(clock);
+            }
+        }
+        let history = engine.history().to_vec();
+        (requests, events.into_inner().unwrap(), history, records)
+    }
+
+    #[test]
+    fn a_host_that_keeps_every_default_changes_no_byte_event_or_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Mutex::new(Vec::new());
+        let bare = scripted_run(&dir, |_| None);
+        let hosted = scripted_run(&dir, |path| {
+            Some(Box::new(RecordingHost {
+                log: &log,
+                gate: None,
+                path,
+            }))
+        });
+        // The host saw the run.
+        assert!(!log.lock().unwrap().is_empty());
+        assert_eq!(bare.0.len(), 3);
+        assert_eq!(bare.0, hosted.0, "model request bytes");
+        assert_eq!(bare.1, hosted.1, "display events");
+        assert_eq!(bare.2, hosted.2, "history");
+        assert_eq!(bare.3, hosted.3, "session records");
+    }
+
+    #[test]
+    fn each_host_event_fires_at_its_place_with_the_turn_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Mutex::new(Vec::new());
+        scripted_run(&dir, |path| {
+            Some(Box::new(RecordingHost {
+                log: &log,
+                gate: None,
+                path,
+            }))
+        });
+        let log = log.lock().unwrap();
+        let expected = [
+            "turn_start go",
+            // A read-only call: the policy allows, the call runs. The
+            // batch has no answered call yet.
+            "tool_before c1 note ReadOnly ask allow prompt=go calls=",
+            r#"tool_after c1 note Some(ReadOnly) input={"call":"c1"} error=false calls="#,
+            // The view holds the answered calls of the running batch.
+            "tool_before c2 write Write ask ask_user prompt=go calls=c1:note:ok",
+            r#"tool_after c2 write Some(Write) input={"call":"c2"} error=false calls=c1:note:ok"#,
+            // The user declines c3: no tool_after.
+            "tool_before c3 exec Execute ask ask_user prompt=go calls=c1:note:ok,c2:write:ok",
+            // An unknown name: no tool_before, but it ran to its error.
+            r#"tool_after c4 nope None input={"call":"c4"} error=true calls=c1:note:ok,c2:write:ok,c3:exec:error"#,
+            // After the turn record.
+            "turn_end completed prompt=go calls=c1:note:ok,c2:write:ok,c3:exec:error,c4:nope:error \
+             final=Some(\"done\") turn_records=1",
+            // The next turn's view starts at its own user message.
+            "turn_start again",
+            "turn_end completed prompt=again calls= final=Some(\"bye\") turn_records=2",
+        ];
+        assert_eq!(*log, expected);
+    }
+
+    #[test]
+    fn tool_after_skips_every_call_that_did_not_run() {
+        // Read-only: the policy refuses the write.
+        let dir = tempfile::tempdir().unwrap();
+        let provider =
+            ScriptedProvider::new(vec![tool_call("c1", "write", json!({})), text_done("done")]);
+        let tools = FakeTools;
+        let log = Mutex::new(Vec::new());
+        let session = session_in(&dir);
+        let host = RecordingHost {
+            log: &log,
+            gate: None,
+            path: session.path().to_path_buf(),
+        };
+        let mut engine = hosted_engine(
+            &provider,
+            &tools,
+            ApprovalMode::ReadOnly,
+            session,
+            Some(Box::new(host)),
+        );
+        block_on(engine.user_turn("go".into(), &noop_sink(), &mut ApproveAll)).unwrap();
+        drop(engine);
+        let lines = log.into_inner().unwrap();
+        assert!(lines[1].starts_with("tool_before c1 write Write read-only deny"));
+        assert!(lines.iter().all(|line| !line.starts_with("tool_after")));
+
+        // Ask: the user allows c1 and stops the turn at c2; c3 never
+        // reaches the host.
+        let dir = tempfile::tempdir().unwrap();
+        let mut events = Vec::new();
+        for id in ["c1", "c2", "c3"] {
+            events.extend(tool_call(id, "exec", json!({"id": id})));
+            events.pop();
+        }
+        events.push(StreamEvent::Done(StopReason::ToolUse));
+        let provider = ScriptedProvider::new(vec![events]);
+        let log = Mutex::new(Vec::new());
+        let session = session_in(&dir);
+        let host = RecordingHost {
+            log: &log,
+            gate: None,
+            path: session.path().to_path_buf(),
+        };
+        let mut engine = hosted_engine(
+            &provider,
+            &tools,
+            ApprovalMode::Ask,
+            session,
+            Some(Box::new(host)),
+        );
+        let mut approver = ScriptedApprover(VecDeque::from([
+            ApprovalAnswer::Allow,
+            ApprovalAnswer::Abort,
+        ]));
+        let outcome = block_on(engine.user_turn("go".into(), &noop_sink(), &mut approver));
+        assert_eq!(outcome.unwrap(), TurnOutcome::Aborted);
+        drop(engine);
+        let kinds: Vec<String> = log
+            .into_inner()
+            .unwrap()
+            .iter()
+            .map(|line| line.split(' ').take(3).collect::<Vec<_>>().join(" "))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "turn_start go",
+                "tool_before c1 exec",
+                "tool_after c1 exec",
+                "tool_before c2 exec",
+                "turn_end aborted prompt=go",
+            ]
+        );
+    }
+
+    #[test]
+    fn turn_end_follows_the_error_record_of_a_provider_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = ScriptedProvider::new(vec![vec![StreamEvent::Done(StopReason::ToolUse)]]);
+        let tools = FakeTools;
+        let log = Mutex::new(Vec::new());
+        let session = session_in(&dir);
+        let host = RecordingHost {
+            log: &log,
+            gate: None,
+            path: session.path().to_path_buf(),
+        };
+        let mut engine = hosted_engine(
+            &provider,
+            &tools,
+            ApprovalMode::Auto,
+            session,
+            Some(Box::new(host)),
+        );
+        block_on(engine.user_turn("hi".into(), &noop_sink(), &mut ApproveAll)).unwrap_err();
+        assert_eq!(turn_records(&engine).len(), 1);
+        drop(engine);
+        assert_eq!(
+            log.into_inner().unwrap(),
+            [
+                "turn_start hi",
+                "turn_end error prompt=hi calls= final=None turn_records=1",
+            ]
+        );
+    }
+
+    /// Never answers: the turn waits at its first ask.
+    struct Stalled;
+
+    impl Approver for Stalled {
+        fn approve<'a>(
+            &'a mut self,
+            _tool: &'a str,
+            _input: &'a Value,
+        ) -> BoxFuture<'a, ApprovalAnswer> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[test]
+    fn a_dropped_turn_gets_no_turn_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = ScriptedProvider::new(vec![tool_call("c1", "write", json!({}))]);
+        let tools = FakeTools;
+        let log = Mutex::new(Vec::new());
+        let session = session_in(&dir);
+        let host = RecordingHost {
+            log: &log,
+            gate: None,
+            path: session.path().to_path_buf(),
+        };
+        let mut engine = hosted_engine(
+            &provider,
+            &tools,
+            ApprovalMode::Ask,
+            session,
+            Some(Box::new(host)),
+        );
+        {
+            let sink = noop_sink();
+            let mut approver = Stalled;
+            let turn = engine.user_turn("go".into(), &sink, &mut approver);
+            let mut turn = std::pin::pin!(turn);
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(turn.as_mut().poll(&mut cx).is_pending());
+        }
+        assert!(turn_records(&engine).is_empty());
+        drop(engine);
+        let lines = log.into_inner().unwrap();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines[0], "turn_start go");
+        assert!(lines[1].starts_with("tool_before c1"));
+    }
+
+    #[test]
+    fn a_host_gate_applies_within_the_engine_limits() {
+        use ApprovalDecision::{Allow, AskUser, Deny};
+        // (mode, gate, the user's answers, the recorded decision, the
+        // call ran)
+        let cases = [
+            // Ask to allow: the call runs without a question.
+            (ApprovalMode::Ask, Allow, vec![], "allow", true),
+            // Allow to ask: the user is asked and declines.
+            (
+                ApprovalMode::Auto,
+                AskUser,
+                vec![ApprovalAnswer::Deny],
+                "ask_user",
+                false,
+            ),
+            // Any decision to deny.
+            (ApprovalMode::Auto, Deny, vec![], "deny", false),
+            (ApprovalMode::Ask, Deny, vec![], "deny", false),
+            // Refused: a deny stays a deny.
+            (ApprovalMode::ReadOnly, Allow, vec![], "deny", false),
+            (ApprovalMode::ReadOnly, AskUser, vec![], "deny", false),
+        ];
+        for (mode, gate, answers, decision, ran) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let provider = ScriptedProvider::new(vec![
+                tool_call("c1", "exec", json!({"cmd": "x"})),
+                text_done("done"),
+            ]);
+            let tools = FakeTools;
+            let log = Mutex::new(Vec::new());
+            let session = session_in(&dir);
+            let host = RecordingHost {
+                log: &log,
+                gate: Some(gate),
+                path: session.path().to_path_buf(),
+            };
+            let mut engine = hosted_engine(&provider, &tools, mode, session, Some(Box::new(host)));
+            // An unscripted question panics: the approver is asked
+            // only when the final decision is an ask.
+            let mut approver = ScriptedApprover(answers.into());
+            block_on(engine.user_turn("go".into(), &noop_sink(), &mut approver)).unwrap();
+            assert!(approver.0.is_empty(), "{mode} {gate:?}");
+
+            let records = records(&engine);
+            let approval = records.iter().find(|r| r["type"] == "approval").unwrap();
+            assert_eq!(approval["decision"], decision, "{mode} {gate:?}");
+            let result = &engine.history()[2].content[0];
+            let ContentBlock::ToolResult { is_error, .. } = result else {
+                panic!("{result:?}");
+            };
+            assert_eq!(!is_error, ran, "{mode} {gate:?}");
+            drop(engine);
+            let after = log
+                .into_inner()
+                .unwrap()
+                .iter()
+                .any(|line| line.starts_with("tool_after"));
+            assert_eq!(after, ran, "{mode} {gate:?}");
         }
     }
 }

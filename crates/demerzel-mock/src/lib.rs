@@ -1,9 +1,11 @@
 //! Mock model endpoint for hermetic tests and Layer-2 benchmarks.
 //!
 //! The server implements `POST /responses`, `POST /v1/responses`,
-//! `POST /v1/messages`, `POST /v1/chat/completions`, and
-//! `GET /v1/models` for key checks. All five replay one scripted list
-//! of responses in request order. It also implements
+//! `POST /v1/messages`, `POST /v1/chat/completions`,
+//! `POST /v1/systemone`, and `GET /v1/models` for key checks. All six
+//! replay one scripted list of responses in request order. A judge
+//! script ([`MockServer::set_judge`]) takes over `/v1/systemone` and
+//! answers by question id ([`systemone`]). The server also implements
 //! `POST /oauth/token` for the credential-refresh and login-exchange
 //! paths. It records every request so tests can assert on
 //! serialization and headers. Never part of the shipped binary.
@@ -14,13 +16,16 @@
 //! the Chat Completions route ([`MockServer::start_chat`]). It checks
 //! that each request after a tool-call reply carries the tool results,
 //! and it stops at end of file on stdin with a count of served and
-//! unused replies and of refused requests. It is not part of the
-//! shipped `demerzel` binary either.
+//! unused replies and of refused requests. A transcript with a `judge`
+//! member also gets the judge route under `/judge`, and its count adds
+//! `judged`, the judge requests that got an answer. It is not part of
+//! the shipped `demerzel` binary either.
 
 pub mod anthropic;
 pub mod codex;
 pub mod compat;
 pub mod responses;
+pub mod systemone;
 pub mod transcript;
 
 use std::collections::VecDeque;
@@ -42,6 +47,8 @@ use axum::response::Response;
 use axum::routing::{get, post};
 use serde_json::Value;
 use serde_json::json;
+
+pub use systemone::JudgeScript;
 
 /// One server-sent event in a scripted response: the text after
 /// `data: `.
@@ -157,6 +164,15 @@ impl MockResponse {
         }
     }
 
+    /// A JSON reply: status 200 with `value` as the whole body.
+    pub fn json(value: Value) -> Self {
+        Self {
+            body: Some(value.to_string()),
+            content_type: "application/json",
+            ..Self::events(Vec::new())
+        }
+    }
+
     /// An error reply with the given HTTP status and no stream.
     pub fn error(status: u16) -> Self {
         Self {
@@ -212,6 +228,10 @@ struct ServerState {
     replies: AtomicU64,
     /// Model requests answered with an error and no scripted reply.
     refused: AtomicU64,
+    /// The judge script; `None` leaves `/v1/systemone` on the list.
+    judge: Mutex<Option<JudgeScript>>,
+    /// Judge requests answered from the judge script.
+    judged: AtomicU64,
 }
 
 /// The routes a server answers.
@@ -235,7 +255,8 @@ impl MockServer {
         Self::start_inner(responses, token_responses, false, Routes::All).await
     }
 
-    /// Start the server with only `POST /v1/chat/completions`. Every
+    /// Start the server with only `POST /v1/chat/completions`, and
+    /// `POST /judge/v1/systemone` once a judge script is set. Every
     /// other path gets 404 and takes no reply from the script.
     pub async fn start_chat(responses: Vec<MockResponse>) -> Self {
         Self::start_inner(responses, Vec::new(), false, Routes::Chat).await
@@ -263,6 +284,8 @@ impl MockServer {
             cycle,
             replies: AtomicU64::new(0),
             refused: AtomicU64::new(0),
+            judge: Mutex::new(None),
+            judged: AtomicU64::new(0),
         });
         let app = match routes {
             Routes::All => Router::new()
@@ -270,13 +293,19 @@ impl MockServer {
                 .route("/responses", post(handle_responses))
                 .route("/v1/responses", post(handle_api_responses))
                 .route("/v1/messages", post(handle_messages))
+                .route("/v1/systemone", post(handle_systemone))
                 .route("/v1/models", get(handle_models))
                 .route("/oauth/token", post(handle_token)),
             // Count every other path and method as a refused request.
+            // The judge route answers only with a judge script.
             Routes::Chat => Router::new()
                 .route(
                     "/v1/chat/completions",
                     post(handle_chat).fallback(refuse_method),
+                )
+                .route(
+                    "/judge/v1/systemone",
+                    post(handle_prefixed_systemone).fallback(refuse_method),
                 )
                 .fallback(refuse_path),
         }
@@ -306,9 +335,24 @@ impl MockServer {
     /// The number of model requests answered with an error and no
     /// scripted reply: a body check refused it, or the script was
     /// empty. A server from [`MockServer::start_chat`] also counts each
-    /// request to another path or with another method.
+    /// request to another path or with another method. A judge request
+    /// that the judge script refuses counts too.
     pub fn refused(&self) -> u64 {
         self.state.refused.load(Ordering::Relaxed)
+    }
+
+    /// Answer `/v1/systemone` by question id from `script`, in place
+    /// of the ordered list. A server from [`MockServer::start_chat`]
+    /// answers the route under the `/judge` prefix. A later call
+    /// replaces the script.
+    pub fn set_judge(&self, script: JudgeScript) {
+        *self.state.judge.lock().unwrap() = Some(script);
+    }
+
+    /// The number of judge requests answered from the judge script.
+    /// Replies from the ordered list count in [`MockServer::served`].
+    pub fn judged(&self) -> u64 {
+        self.state.judged.load(Ordering::Relaxed)
     }
 
     /// All requests received so far, in order.
@@ -375,6 +419,68 @@ async fn handle_chat(
 
 async fn handle_models(State(state): State<Arc<ServerState>>, headers: HeaderMap) -> Response {
     scripted_reply(&state, "/v1/models", &headers, String::new())
+}
+
+/// The judge route of the all-routes server: the judge script when
+/// one is set, else the ordered list.
+async fn handle_systemone(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    judge_reply(&state, "/v1/systemone", &headers, &body)
+        .unwrap_or_else(|| scripted_reply(&state, "/v1/systemone", &headers, body))
+}
+
+/// The judge route of the chat-only server: the judge script, or a
+/// refusal like any other path.
+async fn handle_prefixed_systemone(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    match judge_reply(&state, "/judge/v1/systemone", &headers, &body) {
+        Some(response) => response,
+        None => refuse_path(State(state)).await,
+    }
+}
+
+/// Answer a judge request from the judge script; `None` without one.
+fn judge_reply(
+    state: &ServerState,
+    path: &str,
+    headers: &HeaderMap,
+    body: &str,
+) -> Option<Response> {
+    let script = state.judge.lock().unwrap();
+    let script = script.as_ref()?;
+    let parsed = serde_json::from_str::<Value>(body).unwrap_or(Value::Null);
+    let authorized = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .is_some_and(|key| !key.is_empty());
+    let outcome = systemone::answer(script, authorized, &parsed);
+    if !state.cycle {
+        record(state, path, headers, parsed);
+    }
+    let (status, reply) = match outcome {
+        Ok(reply) => {
+            state.judged.fetch_add(1, Ordering::Relaxed);
+            (StatusCode::OK, reply)
+        }
+        Err(refusal) => {
+            state.refused.fetch_add(1, Ordering::Relaxed);
+            refusal
+        }
+    };
+    Some(
+        Response::builder()
+            .status(status)
+            .header("content-type", "application/json")
+            .body(Body::from(reply.to_string()))
+            .expect("build judge response"),
+    )
 }
 
 /// Replay the next scripted reply, whichever model route asked.

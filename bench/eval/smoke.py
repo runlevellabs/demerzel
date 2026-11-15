@@ -7,11 +7,13 @@ oracle. For each task the runner:
 1. copies the fixture repository to a fresh scratch directory;
 2. starts `demerzel-mock` on the transcript and reads its base URL;
 3. writes a user config file that points an `openai-compat` instance
-   at the mock, and pins the route with `DEMERZEL_` variables;
+   at the mock, and pins the route with `DEMERZEL_` variables; a
+   transcript with a `judge` member also gets a judge instance on the
+   mock;
 4. runs `demerzel --auto -- <prompt>` in the scratch repository, with
    scratch HOME and XDG directories and a minimal environment;
-5. closes the mock's stdin and reads its count of unused replies and
-   refused requests;
+5. closes the mock's stdin and reads its count of unused replies,
+   refused requests, and, for a judged task, judge requests;
 6. runs the oracle in the final state.
 
 No model and no network. The mock serves the replies by request
@@ -55,8 +57,17 @@ INDEX_FIELDS = frozenset({"schema", "tasks"})
 ENTRY_FIELDS = frozenset({"name", "source_step", "summary"})
 TASK_FIELDS = frozenset({"schema", "prompt", "oracle"})
 TRANSCRIPT_FIELDS = frozenset({"schema", "replies"})
+TRANSCRIPT_OPTIONAL = frozenset({"judge"})
 CALL_FIELDS = frozenset({"id", "name", "input"})
+JUDGE_FIELDS = frozenset({"model", "requests", "answers"})
+# The members of each wire answer type of the judge route.
+ANSWER_FIELDS = {
+    "noul": frozenset({"type", "noul"}),
+    "choice": frozenset({"type", "choice", "probabilities", "confidence"}),
+    "score": frozenset({"type", "score", "probabilities", "confidence", "legend"}),
+}
 SUMMARY_FIELDS = frozenset({"served", "unused", "refused"})
+JUDGED_SUMMARY_FIELDS = SUMMARY_FIELDS | {"judged"}
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 # `synthetic`, or a milestone and a plan step: m3-7, m3-8a, m2.5-8f.
 SOURCE_STEP = re.compile(r"synthetic|m[0-9]+(?:\.[0-9]+)?-[0-9]+[a-z]?")
@@ -80,6 +91,11 @@ MOCK_LINE_BYTES = 64 * 1024
 KEPT_VARIABLES = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR")
 INSTANCE = "smoke"
 MODEL = "scripted"
+# The judge instance of a judged task. Its key variable has no
+# DEMERZEL_ prefix, so it cannot meet a variable the binary reads.
+JUDGE_INSTANCE = "judge"
+JUDGE_KEY_VARIABLE = "SMOKE_JUDGE_KEY"
+JUDGE_KEY = "fake-smoke-judge-key"
 
 EXIT_FAILED = 1
 EXIT_INVALID = 2
@@ -157,11 +173,12 @@ def load_json(path: Path):
     return document
 
 
-def check_fields(where: str, value, fields: frozenset) -> dict:
-    """An object with exactly `fields` and `schema: 1`, when `schema` is one of them."""
+def check_fields(where: str, value, fields: frozenset, optional: frozenset = frozenset()) -> dict:
+    """An object with exactly `fields`, any of `optional`, and `schema: 1`,
+    when `schema` is one of them."""
     if not isinstance(value, dict):
         raise InvalidTask(f"{where}: expected a JSON object")
-    unknown = sorted(set(value) - fields)
+    unknown = sorted(set(value) - fields - optional)
     if unknown:
         raise InvalidTask(f"{where}: unknown field {', '.join(map(repr, unknown))}")
     missing = sorted(fields - set(value))
@@ -175,6 +192,20 @@ def check_fields(where: str, value, fields: frozenset) -> dict:
 def check_text(where: str, value) -> str:
     if not isinstance(value, str) or not value:
         raise InvalidTask(f"{where}: expected a non-empty string")
+    return value
+
+
+def check_number(where: str, value) -> None:
+    if type(value) not in (int, float):
+        raise InvalidTask(f"{where}: expected a number")
+
+
+def check_numbers(where: str, value) -> dict:
+    """A non-empty object of numbers."""
+    if not isinstance(value, dict) or not value:
+        raise InvalidTask(f"{where}: expected a non-empty object of numbers")
+    for name, number in value.items():
+        check_number(f"{where}.{name}", number)
     return value
 
 
@@ -214,8 +245,9 @@ def load_index(root: Path) -> list[dict]:
     return entries
 
 
-def check_task(task_dir: Path) -> tuple[dict, int]:
-    """The task file of one task and its reply count, after the checks of its directory."""
+def check_task(task_dir: Path) -> tuple[dict, int, dict | None]:
+    """The task file of one task, its reply count, and its judge member,
+    after the checks of its directory."""
     if not task_dir.is_dir():
         raise InvalidTask(f"{task_dir}: the task directory does not exist")
     path = task_dir / "task.json"
@@ -226,20 +258,24 @@ def check_task(task_dir: Path) -> tuple[dict, int]:
         raise InvalidTask(f"{path}: oracle: expected a non-empty list")
     for position, part in enumerate(oracle):
         check_text(f"{path}: oracle[{position}]", part)
-    replies = check_transcript(task_dir / "transcript.json")
+    replies, judge = check_transcript(task_dir / "transcript.json")
     if not (task_dir / "repo").is_dir():
         raise InvalidTask(f"{task_dir / 'repo'}: the fixture directory does not exist")
-    return task, replies
+    return task, replies, judge
 
 
-def check_transcript(path: Path) -> int:
+def check_transcript(path: Path) -> tuple[int, dict | None]:
     """Tool-call replies, then exactly one text reply, which is last.
 
     This shape is an early check: the run asks for each reply in turn
     and ends at the text. The proof that the run used every reply is
-    the mock's count at the end of the run. Return the reply count.
+    the mock's count at the end of the run. Return the reply count and
+    the judge member, or None without one.
     """
-    transcript = check_fields(str(path), load_json(path), TRANSCRIPT_FIELDS)
+    transcript = check_fields(str(path), load_json(path), TRANSCRIPT_FIELDS, TRANSCRIPT_OPTIONAL)
+    judge = transcript.get("judge")
+    if "judge" in transcript:
+        check_judge(f"{path}: judge", judge)
     replies = transcript["replies"]
     if not isinstance(replies, list) or not replies:
         raise InvalidTask(f"{path}: replies: expected a non-empty list")
@@ -271,7 +307,44 @@ def check_transcript(path: Path) -> int:
             check_text(f"{call_where}.name", call["name"])
             if not isinstance(call["input"], dict):
                 raise InvalidTask(f"{call_where}.input: expected a JSON object")
-    return len(replies)
+    return len(replies), judge
+
+
+def check_judge(where: str, judge) -> None:
+    """The judge member: the reply model, the expected number of judge
+    requests, and one wire answer per question id."""
+    check_fields(where, judge, JUDGE_FIELDS)
+    check_text(f"{where}.model", judge["model"])
+    if type(judge["requests"]) is not int or judge["requests"] < 0:
+        raise InvalidTask(f"{where}.requests: expected a non-negative integer")
+    answers = judge["answers"]
+    if not isinstance(answers, dict) or not answers:
+        raise InvalidTask(f"{where}.answers: expected a non-empty object")
+    for question, answer in answers.items():
+        check_answer(f"{where}.answers.{question}", answer)
+
+
+def check_answer(where: str, answer) -> None:
+    """One wire answer of the judge route, by its `type`."""
+    kind = answer.get("type") if isinstance(answer, dict) else None
+    if kind not in ANSWER_FIELDS:
+        raise InvalidTask(f"{where}: expected an object with a type of {', '.join(ANSWER_FIELDS)}")
+    check_fields(where, answer, ANSWER_FIELDS[kind])
+    if kind == "noul":
+        check_number(f"{where}.noul", answer["noul"])
+        return
+    check_number(f"{where}.confidence", answer["confidence"])
+    probabilities = check_numbers(f"{where}.probabilities", answer["probabilities"])
+    if kind == "choice":
+        check_text(f"{where}.choice", answer["choice"])
+        return
+    check_number(f"{where}.score", answer["score"])
+    levels = {str(level) for level in range(len(probabilities))}
+    legend = answer["legend"]
+    if set(probabilities) != levels:
+        raise InvalidTask(f"{where}.probabilities: expected the levels 0 to {len(levels) - 1} as keys")
+    if not isinstance(legend, dict) or set(legend) != levels or not all(isinstance(text, str) for text in legend.values()):
+        raise InvalidTask(f"{where}.legend: expected one string for each level of probabilities")
 
 
 def validate(root: Path) -> tuple[list[dict], list[str]]:
@@ -440,39 +513,65 @@ def run_env(scratch: Path) -> dict[str, str]:
     return env
 
 
-def write_config(config_home: Path, url: str) -> None:
+def write_config(config_home: Path, url: str, judge: dict | None = None) -> None:
+    """The user config file. A judged task also gets a judge instance on
+    the mock's judge route, with its key in JUDGE_KEY_VARIABLE."""
     directory = config_home / "demerzel"
     directory.mkdir()
     # A JSON string of ASCII text is also a TOML basic string.
-    (directory / "config.toml").write_text(
+    text = (
         f"provider = {json.dumps(INSTANCE)}\n"
         f"\n[providers.{INSTANCE}]\n"
         'kind = "openai-compat"\n'
         f"base_url = {json.dumps(url + '/v1')}\n"
-        f"model = {json.dumps(MODEL)}\n",
-        encoding="utf-8",
+        f"model = {json.dumps(MODEL)}\n"
     )
+    if judge is not None:
+        text += (
+            f"\n[providers.{JUDGE_INSTANCE}]\n"
+            'kind = "typesafe"\n'
+            f"base_url = {json.dumps(url + '/judge')}\n"
+            f"model = {toml_string(judge['model'])}\n"
+            f"api_key_env = {json.dumps(JUDGE_KEY_VARIABLE)}\n"
+            f"\n[judgments]\n"
+            f"instance = {json.dumps(JUDGE_INSTANCE)}\n"
+        )
+    (directory / "config.toml").write_text(text, encoding="utf-8")
 
 
-def agent_env(env: dict, url: str) -> dict:
+def toml_string(text: str) -> str:
+    """A TOML basic string of any text: each control character, quote,
+    and backslash as a `\\u` escape."""
+    return '"' + "".join(
+        f"\\u{ord(c):04x}" if c < " " or c in '"\\\x7f' else c for c in text
+    ) + '"'
+
+
+def agent_env(env: dict, url: str, judge: dict | None = None) -> dict:
     """Variables outrank the project file: its `provider`, `model`, and
-    `base_url` cannot move the run off the mock."""
-    return dict(env, DEMERZEL_PROVIDER=INSTANCE, DEMERZEL_MODEL=MODEL, DEMERZEL_BASE_URL=url + "/v1")
+    `base_url` cannot move the run off the mock. A judged task also gets
+    the judge's fake key."""
+    pinned = dict(env, DEMERZEL_PROVIDER=INSTANCE, DEMERZEL_MODEL=MODEL, DEMERZEL_BASE_URL=url + "/v1")
+    if judge is not None:
+        pinned[JUDGE_KEY_VARIABLE] = JUDGE_KEY
+    return pinned
 
 
-def check_summary(line: str | None, total: int) -> str | None:
+def check_summary(line: str | None, total: int, judge: dict | None = None) -> str | None:
     """Why the mock's count fails the task, or None when the run used
-    every reply and the mock refused no request."""
+    every reply, the mock refused no request, and a judged task sent
+    the judge requests its transcript expects."""
     if line is None:
         return "the mock printed no count line"
     try:
         summary = json.loads(line)
     except ValueError:
         summary = None
+    fields = SUMMARY_FIELDS if judge is None else JUDGED_SUMMARY_FIELDS
     if (
         not isinstance(summary, dict)
-        or set(summary) != SUMMARY_FIELDS
-        or not all(type(summary[field]) is int and summary[field] >= 0 for field in SUMMARY_FIELDS)
+        or set(summary) != fields
+        or not all(type(summary[field]) is int and summary[field] >= 0 for field in fields)
     ):
         return f"the count line of the mock is malformed: {clip(line)!r}"
     if summary["unused"] or summary["refused"] or summary["served"] != total:
@@ -480,6 +579,8 @@ def check_summary(line: str | None, total: int) -> str | None:
             f"the mock served {summary['served']} of {total} replies; "
             f"{summary['unused']} unused; {summary['refused']} refused"
         )
+    if judge is not None and summary["judged"] != judge["requests"]:
+        return f"the mock answered {summary['judged']} judge requests; the transcript expects {judge['requests']}"
     return None
 
 
@@ -502,7 +603,7 @@ def run_task(task_dir: Path, binary: Path, mock: Path) -> tuple[str | None, list
 
 
 def run_in(scratch: Path, task_dir: Path, binary: Path, mock_path: Path) -> tuple[str | None, list[str]]:
-    task, total = check_task(task_dir)
+    task, total, judge = check_task(task_dir)
     try:
         repo = scratch / "repo"
         shutil.copytree(task_dir / "repo", repo, symlinks=True)
@@ -537,7 +638,7 @@ def run_in(scratch: Path, task_dir: Path, binary: Path, mock_path: Path) -> tupl
             return "mock start", [reason] + tail(mock_err_path, "mock stderr")
         url = line
         try:
-            write_config(Path(env["XDG_CONFIG_HOME"]), url)
+            write_config(Path(env["XDG_CONFIG_HOME"]), url, judge)
         except OSError as error:
             return "setup", [f"the config file was not written: {error}"]
 
@@ -545,7 +646,7 @@ def run_in(scratch: Path, task_dir: Path, binary: Path, mock_path: Path) -> tupl
         try:
             with open(out_path, "wb") as out, open(err_path, "wb") as err:
                 status = run_child(
-                    [str(binary), "--auto", "--", task["prompt"]], repo, agent_env(env, url),
+                    [str(binary), "--auto", "--", task["prompt"]], repo, agent_env(env, url, judge),
                     out, err, AGENT_TIMEOUT, signal.SIGINT,
                 )
         except (OSError, ValueError) as error:
@@ -556,7 +657,7 @@ def run_in(scratch: Path, task_dir: Path, binary: Path, mock_path: Path) -> tupl
             mock.process.stdin.close()
         except OSError:
             pass
-        count_error = check_summary(mock.read_line(MOCK_SUMMARY_TIMEOUT), total)
+        count_error = check_summary(mock.read_line(MOCK_SUMMARY_TIMEOUT), total, judge)
         mock.wait_exit(STOP_GRACE)
         mock.stop(signal.SIGTERM)
         logs_tail = (

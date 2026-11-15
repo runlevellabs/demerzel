@@ -716,9 +716,10 @@ async fn verify_key_maps_the_status_to_the_outcome() {
     .await;
     let http = reqwest::Client::new();
 
-    demerzel_providers::anthropic::verify_key(&http, &mock.url(), "sk-good")
+    let accepted = demerzel_providers::anthropic::verify_key(&http, &mock.url(), "sk-good")
         .await
         .unwrap();
+    assert_eq!(accepted, demerzel_providers::KeyCheck::Accepted);
     let rejected = demerzel_providers::anthropic::verify_key(&http, &mock.url(), "sk-bad")
         .await
         .unwrap_err();

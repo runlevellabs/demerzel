@@ -1,0 +1,17 @@
+{
+  "model": "jev-1.14.0",
+  "trace_id": "trace-7f3a",
+  "answers": {
+    "tests_pass": {
+      "type": "noul",
+      "noul": 0.25,
+      "calibration": {
+        "bucket": 3
+      }
+    }
+  },
+  "usage": {
+    "input_tokens": 96,
+    "output_tokens": 2
+  }
+}

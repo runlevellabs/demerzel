@@ -1,7 +1,8 @@
 //! The transcript format: what parses, and what the parser refuses.
 
 use demerzel_mock::SseEvent;
-use demerzel_mock::transcript::parse;
+use demerzel_mock::systemone::{choice, noul, score};
+use demerzel_mock::transcript::{Transcript, parse};
 use serde_json::{Value, json};
 
 fn doc(replies: Value) -> String {
@@ -111,4 +112,45 @@ fn malformed_replies_are_refused_with_their_index() {
             .unwrap_or_else(|| panic!("accepted {reply}"));
         assert_eq!(error.reply, Some(1), "{reply}");
     }
+}
+
+#[test]
+fn a_judge_member_parses_to_the_builders_wire_answers() {
+    let mut legend_score = score(1.5, &[0.25, 0.25, 0.5], 0.75);
+    legend_score["legend"] = json!({"0": "low", "1": "mid", "2": "high"});
+    let text = json!({
+        "schema": 1,
+        "replies": [{"text": "x"}],
+        "judge": {
+            "model": "judge-9.9.9",
+            "requests": 0,
+            "answers": {
+                "done": {"type": "noul", "noul": 1},
+                "kind": choice("fix", &[("fix", 0.75), ("docs", 0.25)], 0.5),
+                "risk": legend_score,
+            },
+        },
+    })
+    .to_string();
+    let transcript = Transcript::parse(&text).unwrap();
+    assert_eq!(transcript.replies.len(), 1);
+    let judge = transcript.judge.expect("the judge member");
+    assert_eq!(
+        (judge.requests, judge.script.model.as_str()),
+        (0, "judge-9.9.9")
+    );
+    let answers = &judge.script.answers;
+    assert_eq!(answers["done"], noul(1.0));
+    assert_eq!(answers["kind"]["probabilities"]["docs"], 0.25);
+    // A score answer keeps its own legend text.
+    assert_eq!(answers["risk"], legend_score);
+    // A score legend must name each level.
+    let mut short = legend_score.clone();
+    short["legend"] = json!({"0": "low"});
+    let text = json!({"schema": 1, "replies": [{"text": "x"}],
+        "judge": {"model": "m", "requests": 1, "answers": {"risk": short}}});
+    assert!(Transcript::parse(&text.to_string()).is_err());
+    // Without the member there is no judge script.
+    let plain = Transcript::parse(&doc(json!([{"text": "x"}]))).unwrap();
+    assert!(plain.judge.is_none());
 }

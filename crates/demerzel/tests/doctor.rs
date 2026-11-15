@@ -598,8 +598,14 @@ impl Bed {
     /// Run `login <name>` with `key` on a piped stdin. Returns stdout,
     /// stderr, and the exit code.
     fn login(&self, name: &str, key: &str) -> (String, String, i32) {
-        let mut child = self
-            .command()
+        self.login_with(name, key, &[])
+    }
+
+    /// [`Bed::login`] with the variables `env` set.
+    fn login_with(&self, name: &str, key: &str, env: &[(&str, &str)]) -> (String, String, i32) {
+        let mut command = self.command();
+        command.envs(env.iter().copied());
+        let mut child = command
             .args(["login", name])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -897,4 +903,343 @@ fn doctor_shows_the_request_shape_of_an_instance_with_thinking_off() {
         out.contains("problem:") && out.contains("`thinking`"),
         "{out}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_judge_login_checks_the_key_at_v1_models_and_stores_it_only_on_success() {
+    use demerzel_mock::{MockResponse, MockServer};
+
+    let mock = MockServer::start(
+        vec![
+            MockResponse::json(serde_json::json!({"models": []})),
+            MockResponse::error(401),
+        ],
+        Vec::new(),
+    )
+    .await;
+    let bed = Bed::new();
+    bed.write_user_config(&format!(
+        "[providers.judge]\nkind = \"typesafe\"\nbase_url = \"{url}\"\n\
+         [providers.other]\nkind = \"typesafe\"\nbase_url = \"{url}\"",
+        url = mock.url()
+    ));
+
+    // A 200 stores the key, bound to the endpoint that checked it.
+    let (out, err, code) = bed.login("judge", "fake-judge-key");
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains(&mock.url()), "{out}");
+    let store = bed.store();
+    assert_eq!(store["keys"]["judge"]["api_key"], "fake-judge-key");
+    assert_eq!(store["keys"]["judge"]["base_url"], mock.url());
+
+    // A 401 stores nothing.
+    let (_, err, code) = bed.login("other", "fake-refused-key");
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("401"), "{err}");
+    assert!(bed.store()["keys"]["other"].is_null(), "{}", bed.store());
+
+    // Both checks went to the kind's route, with the typed key.
+    let received = mock.received();
+    assert_eq!(received.len(), 2);
+    for (request, key) in received.iter().zip(["fake-judge-key", "fake-refused-key"]) {
+        assert_eq!(request.path, "/v1/models");
+        assert_eq!(
+            request.authorization.as_deref(),
+            Some(format!("Bearer {key}").as_str())
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_judge_login_ignores_the_head_endpoint_overrides() {
+    use demerzel_mock::{MockResponse, MockServer};
+
+    let judge = MockServer::start(
+        vec![
+            MockResponse::json(serde_json::json!({"models": []})),
+            MockResponse::error(403),
+        ],
+        Vec::new(),
+    )
+    .await;
+    // The endpoint the head overrides name; it must see no request.
+    let head = MockServer::start(
+        vec![MockResponse::json(serde_json::json!({"models": []}))],
+        Vec::new(),
+    )
+    .await;
+    let bed = Bed::new();
+    bed.write_user_config(&format!(
+        "[providers.judge]\nkind = \"typesafe\"\nbase_url = \"{}\"",
+        judge.url()
+    ));
+    let (out, err, code) = bed.login_with(
+        "judge",
+        "fake-judge-key",
+        &[("DEMERZEL_BASE_URL", &head.url())],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains(&judge.url()), "{out}");
+    assert!(!out.contains(&head.url()), "{out}");
+    // One line names the dropped override and the endpoint in use.
+    let lines: Vec<&str> = err
+        .lines()
+        .filter(|line| line.contains(&head.url()))
+        .collect();
+    assert_eq!(lines.len(), 1, "{err}");
+    assert!(lines[0].contains(&judge.url()), "{err}");
+    assert!(head.received().is_empty());
+    let received = judge.received();
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0].path, "/v1/models");
+    assert_eq!(bed.store()["keys"]["judge"]["base_url"], judge.url());
+
+    // A check that fails with another status than 401 stores nothing
+    // either, and says so.
+    let (_, err, code) = bed.login("judge", "fake-other-key");
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("403") && err.contains("not stored"), "{err}");
+    assert_eq!(bed.store()["keys"]["judge"]["api_key"], "fake-judge-key");
+}
+
+/// The lines of the `judgments` section of a `doctor` report.
+fn judgments_section(out: &str) -> Vec<&str> {
+    out.lines()
+        .skip_while(|line| *line != "judgments")
+        .skip(1)
+        .take_while(|line| line.starts_with(' '))
+        .map(str::trim_start)
+        .collect()
+}
+
+#[test]
+fn doctor_lists_the_judge_its_checks_and_notes_an_alias_model() {
+    let bed = Bed::new();
+    bed.write_store();
+    let judge = "[providers.judge]\nkind = \"typesafe\"\napi_key_env = \"DMZ_TEST_JUDGE_KEY\"\n";
+    let doctor = || {
+        let output = bed
+            .command()
+            .env("DMZ_TEST_JUDGE_KEY", "fake-judge-key")
+            .arg("doctor")
+            .output()
+            .unwrap();
+        let out = String::from_utf8_lossy(&output.stdout).into_owned();
+        (out, output.status.code().unwrap())
+    };
+
+    // The default model is an alias.
+    bed.write_user_config(&format!(
+        "{judge}[judgments]\ninstance = \"judge\"\nchecks = {{ progress = \"off\" }}"
+    ));
+    let (out, code) = doctor();
+    // A correct setup is no problem and draws no warning.
+    assert_eq!(code, 0, "{out}");
+    assert!(!out.contains("warning"), "{out}");
+    assert!(!out.contains("fake-judge-key"), "{out}");
+    let section = judgments_section(&out);
+    let has = |prefix: &str, part: &str| {
+        section
+            .iter()
+            .any(|line| line.starts_with(prefix) && line.contains(part))
+    };
+    assert!(has("instance = judge", "user file"), "{section:?}");
+    assert!(has("judge:", "typesafe"), "{section:?}");
+    assert!(has("judge:", "jev-latest"), "{section:?}");
+    assert!(has("judge:", "DMZ_TEST_JUDGE_KEY"), "{section:?}");
+    assert!(has("checks.outcome = log", "default"), "{section:?}");
+    assert!(has("checks.progress = off", "user file"), "{section:?}");
+    assert!(has("checks.claim = log", ""), "{section:?}");
+    assert!(has("checks.approval = log", ""), "{section:?}");
+    assert!(has("max_calls = 500", "default"), "{section:?}");
+    assert!(has("note:", "jev-latest"), "{section:?}");
+    // The instance list names the same model, and the credentials
+    // list the judge's key.
+    let listed = out
+        .lines()
+        .find(|line| line.trim_start().starts_with("judge: typesafe"))
+        .unwrap_or_else(|| panic!("no instance line:\n{out}"));
+    assert!(listed.contains("jev-latest"), "{listed}");
+    let credentials: Vec<&str> = out
+        .lines()
+        .skip_while(|line| *line != "credentials")
+        .take_while(|line| *line == "credentials" || line.starts_with(' '))
+        .collect();
+    assert!(
+        credentials
+            .iter()
+            .any(|line| line.contains("judge") && line.contains("DMZ_TEST_JUDGE_KEY")),
+        "{credentials:?}"
+    );
+
+    // Keys a judge does not use draw a warning, not a problem.
+    bed.write_user_config(&format!(
+        "{judge}effort = \"low\"\ncontext_window = 1000\n[judgments]\ninstance = \"judge\""
+    ));
+    let (out, code) = doctor();
+    assert_eq!(code, 0, "{out}");
+    let section = judgments_section(&out);
+    for key in ["providers.judge.effort", "providers.judge.context_window"] {
+        assert!(
+            section
+                .iter()
+                .any(|line| line.starts_with("warning:") && line.contains(key)),
+            "{key}: {section:?}"
+        );
+    }
+
+    // Rules: a problem in the user file, a warning in a project file.
+    bed.write_user_config(&format!(
+        "{judge}[judgments]\ninstance = \"judge\"\n[[judgments.rules]]\nask = \"x\""
+    ));
+    let (out, code) = doctor();
+    assert_eq!(code, 1, "{out}");
+    assert!(
+        judgments_section(&out)
+            .iter()
+            .any(|line| line.starts_with("problem:") && line.contains("judgments.rules")),
+        "{out}"
+    );
+    bed.write_user_config(&format!("{judge}[judgments]\ninstance = \"judge\""));
+    bed.write_project_config("[[judgments.rules]]\nask = \"x\"");
+    let (out, code) = doctor();
+    assert_eq!(code, 0, "{out}");
+    assert!(
+        judgments_section(&out)
+            .iter()
+            .any(|line| line.starts_with("warning:") && line.contains("judgments.rules")),
+        "{out}"
+    );
+    bed.write_project_config("");
+
+    // A pinned version id draws no note.
+    bed.write_user_config(&format!(
+        "{judge}model = \"jev-1.14.0\"\n[judgments]\ninstance = \"judge\"\nmax_calls = 40"
+    ));
+    let (out, code) = doctor();
+    assert_eq!(code, 0, "{out}");
+    let section = judgments_section(&out);
+    assert!(
+        section.iter().any(|line| line.contains("jev-1.14.0")),
+        "{section:?}"
+    );
+    assert!(
+        !section.iter().any(|line| line.starts_with("note:")),
+        "{section:?}"
+    );
+    assert!(
+        section
+            .iter()
+            .any(|line| line.starts_with("max_calls = 40")),
+        "{section:?}"
+    );
+}
+
+#[test]
+fn doctor_says_judgments_are_off_and_lists_the_ignored_project_keys() {
+    let bed = Bed::new();
+    bed.write_store();
+    let (out, code) = bed.doctor(&[]);
+    assert_eq!(code, 0, "{out}");
+    let section = judgments_section(&out);
+    // One line, and no check runs.
+    assert_eq!(section.len(), 1, "{section:?}");
+    assert!(section[0].contains("off"), "{section:?}");
+    // A user without judgments sees no judge in the adapter list.
+    assert!(!out.contains("typesafe"), "{out}");
+
+    // A project file cannot turn judgments on, nor set a value this
+    // build does not take; each ignored key shows.
+    bed.write_user_config("[providers.judge]\nkind = \"typesafe\"");
+    bed.write_project_config(
+        "[judgments]\ninstance = \"judge\"\nchecks = { outcome = \"warn\" }\nmax_calls = 900",
+    );
+    let (out, code) = bed.doctor(&[]);
+    assert_eq!(code, 0, "{out}");
+    let section = judgments_section(&out);
+    for key in [
+        "judgments.instance",
+        "judgments.checks.outcome",
+        "judgments.max_calls",
+    ] {
+        assert!(
+            section
+                .iter()
+                .any(|line| line.starts_with("warning:") && line.contains(key)),
+            "{key}: {section:?}"
+        );
+    }
+    assert!(
+        section.iter().any(|line| line.starts_with("off")),
+        "{section:?}"
+    );
+
+    // A project file cannot change the judge instance either.
+    bed.write_user_config(
+        "[providers.judge]\nkind = \"typesafe\"\n[judgments]\ninstance = \"judge\"",
+    );
+    bed.write_project_config("[providers.judge]\nmodel = \"jev-preview\"");
+    let (out, code) = bed.doctor(&[]);
+    assert_eq!(code, 0, "{out}");
+    let section = judgments_section(&out);
+    assert!(
+        section
+            .iter()
+            .any(|line| line.starts_with("warning:") && line.contains("providers.judge.model")),
+        "{section:?}"
+    );
+    assert!(
+        section
+            .iter()
+            .any(|line| line.starts_with("judge:") && line.contains("jev-latest")),
+        "{section:?}"
+    );
+    bed.write_project_config("");
+
+    // The same value in the user file is a problem.
+    bed.write_user_config(
+        "[providers.judge]\nkind = \"typesafe\"\n\
+         [judgments]\ninstance = \"judge\"\nchecks = { outcome = \"warn\" }",
+    );
+    let (out, code) = bed.doctor(&[]);
+    assert_eq!(code, 1, "{out}");
+    assert!(
+        judgments_section(&out)
+            .iter()
+            .any(|line| line.starts_with("problem:") && line.contains("judgments.checks.outcome")),
+        "{out}"
+    );
+}
+
+#[test]
+fn a_judgments_instance_that_cannot_judge_stops_the_run_at_boot() {
+    let bed = Bed::new();
+    bed.write_store();
+    for (user, name) in [
+        ("[judgments]\ninstance = \"ghost\"", "ghost"),
+        (
+            "[providers.local]\nkind = \"openai-compat\"\n\
+             base_url = \"http://127.0.0.1:9/v1\"\nmodel = \"m\"\n\
+             [judgments]\ninstance = \"local\"",
+            "local",
+        ),
+    ] {
+        bed.write_user_config(user);
+        let output = bed.command().arg("hi").output().unwrap();
+        assert_eq!(output.status.code(), Some(1), "{name}: {output:?}");
+        let err = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            err.contains("judgments.instance") && err.contains(&format!("`{name}`")),
+            "{name}: {err}"
+        );
+        // `doctor` counts the same refusal.
+        let (out, code) = bed.doctor(&[]);
+        assert_eq!(code, 1, "{name}: {out}");
+        assert!(
+            judgments_section(&out)
+                .iter()
+                .any(|line| line.starts_with("problem:") && line.contains(name)),
+            "{name}: {out}"
+        );
+    }
 }

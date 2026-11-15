@@ -1,0 +1,4 @@
+lint: mode.txt has no owner
+exit 1
+lint: mode.txt has no owner
+exit 1

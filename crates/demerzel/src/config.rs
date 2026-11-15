@@ -42,6 +42,11 @@ pub const DEFAULT_THEME: &str = "terminal";
 /// The role of the main loop. Its chain's first target is the head
 /// target, unless a flag or a variable names one.
 pub const DEFAULT_ROLE: &str = "default";
+/// Judgment requests one session may send before its checks stop.
+pub const DEFAULT_JUDGE_MAX_CALLS: u32 = 500;
+/// The action of a built-in check when nothing sets one and a judge
+/// instance exists.
+pub const DEFAULT_CHECK_ACTION: CheckAction = CheckAction::Log;
 
 /// Environment variables, one per flag.
 pub const ENV_PROVIDER: &str = "DEMERZEL_PROVIDER";
@@ -134,6 +139,198 @@ pub struct Settings {
     pub roles: BTreeMap<String, Setting<Vec<RoleTarget>>>,
     /// The `[tui]` table.
     pub tui: TuiSettings,
+    /// The `[judgments]` table. [`judgments`] checks it against the
+    /// configured instances.
+    pub judgments: JudgmentSettings,
+}
+
+/// The resolved `[judgments]` keys.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct JudgmentSettings {
+    /// The judge instance. Only the user file sets it; `None` turns
+    /// judgments off.
+    pub instance: Setting<Option<String>>,
+    /// Each built-in check with its action, in [`Check::ALL`] order.
+    pub checks: BTreeMap<Check, Setting<CheckAction>>,
+    /// Judgment requests one session may send.
+    pub max_calls: Setting<u32>,
+    /// User-file check values that are not valid: each stops the run.
+    pub problems: Vec<String>,
+    /// The project-file judgment keys the trust rule ignored. The
+    /// warnings of [`resolve`] hold them too; `doctor` prints them in
+    /// its judgments section.
+    pub ignored: Vec<String>,
+}
+
+/// A built-in judgment check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum Check {
+    /// A call returned without its error flag, but failed its purpose.
+    Outcome,
+    /// A call repeats an earlier failed call.
+    Progress,
+    /// The final message claims a result the turn does not show.
+    Claim,
+    /// A write or execute call reaches the approval policy.
+    Approval,
+}
+
+impl Check {
+    /// Every check, in the order `doctor` lists them. A slice, so a
+    /// new check never changes the item's type.
+    pub const ALL: &'static [Check] = &[
+        Check::Outcome,
+        Check::Progress,
+        Check::Claim,
+        Check::Approval,
+    ];
+
+    /// The check's key under `judgments.checks`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Check::Outcome => "outcome",
+            Check::Progress => "progress",
+            Check::Claim => "claim",
+            Check::Approval => "approval",
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|check| check.as_str() == name)
+    }
+}
+
+impl fmt::Display for Check {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// What a check does with its answer. The order is the rank: a
+/// project file can set a check only at or below the user's action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum CheckAction {
+    /// The check does not run.
+    Off,
+    /// The session file records the answers. Nothing else changes.
+    Log,
+}
+
+impl CheckAction {
+    /// Every action this build takes, in rank order.
+    pub const ALL: &'static [CheckAction] = &[CheckAction::Off, CheckAction::Log];
+
+    /// The action's config value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CheckAction::Off => "off",
+            CheckAction::Log => "log",
+        }
+    }
+}
+
+impl fmt::Display for CheckAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for CheckAction {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, String> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|action| action.as_str() == text)
+            .ok_or_else(|| format!("must be {}, not `{text}`", check_actions()))
+    }
+}
+
+/// The valid action values as a phrase: "`off` or `log`".
+fn check_actions() -> String {
+    let names: Vec<String> = CheckAction::ALL
+        .iter()
+        .map(|action| format!("`{action}`"))
+        .collect();
+    match names.split_last() {
+        Some((last, [])) => last.clone(),
+        Some((last, [first])) => format!("{first} or {last}"),
+        Some((last, rest)) => format!("{}, or {last}", rest.join(", ")),
+        None => String::new(),
+    }
+}
+
+/// The judgments of a run, checked at boot by [`judgments`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Judgments {
+    /// The judge instance: one of the run's configured instances,
+    /// never the head.
+    pub instance: String,
+    pub checks: Checks,
+    /// Judgment requests one session may send.
+    pub max_calls: u32,
+}
+
+/// The action of each built-in check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Checks {
+    pub outcome: CheckAction,
+    pub progress: CheckAction,
+    pub claim: CheckAction,
+    pub approval: CheckAction,
+}
+
+impl Judgments {
+    /// Judgments by `instance` with every check at its default action
+    /// and the default call cap.
+    pub fn new(instance: impl Into<String>) -> Self {
+        Self {
+            instance: instance.into(),
+            checks: Checks::uniform(DEFAULT_CHECK_ACTION),
+            max_calls: DEFAULT_JUDGE_MAX_CALLS,
+        }
+    }
+}
+
+impl Checks {
+    /// Every check at `action`.
+    pub fn uniform(action: CheckAction) -> Self {
+        Self {
+            outcome: action,
+            progress: action,
+            claim: action,
+            approval: action,
+        }
+    }
+
+    /// Set the action of `check`.
+    pub fn set(&mut self, check: Check, action: CheckAction) {
+        match check {
+            Check::Outcome => self.outcome = action,
+            Check::Progress => self.progress = action,
+            Check::Claim => self.claim = action,
+            Check::Approval => self.approval = action,
+        }
+    }
+
+    /// The action of `check`.
+    pub fn get(&self, check: Check) -> CheckAction {
+        match check {
+            Check::Outcome => self.outcome,
+            Check::Progress => self.progress,
+            Check::Claim => self.claim,
+            Check::Approval => self.approval,
+        }
+    }
 }
 
 /// One target of a role's chain as a config file writes it: a
@@ -240,6 +437,29 @@ struct ProviderKeys {
     thinking: Option<ThinkingMode>,
 }
 
+impl ProviderKeys {
+    /// Each key the table sets, with its value as the file wrote it.
+    fn set_keys(&self) -> Vec<(&'static str, String)> {
+        let mut keys = Vec::new();
+        let mut add = |key, value: Option<String>| {
+            if let Some(value) = value {
+                keys.push((key, value));
+            }
+        };
+        add("kind", self.kind.clone());
+        add("api_key_env", self.api_key_env.clone());
+        add("base_url", self.base_url.clone());
+        add("model", self.model.clone());
+        add("effort", self.effort.map(|effort| effort.to_string()));
+        add("context_window", self.context_window.map(|w| w.to_string()));
+        add(
+            "thinking",
+            self.thinking.map(|mode| mode.as_str().to_string()),
+        );
+        keys
+    }
+}
+
 /// Interface keys from the `[tui]` table.
 #[derive(Debug, Clone, Default, PartialEq)]
 struct TuiKeys {
@@ -247,6 +467,20 @@ struct TuiKeys {
     markdown: Option<bool>,
     thinking: Option<Thinking>,
     theme: Option<String>,
+}
+
+/// Judgment keys from the `[judgments]` table.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct JudgmentKeys {
+    instance: Option<String>,
+    /// The raw value of each known check. The parse takes any value:
+    /// the resolver checks it, where it knows which file set it, so
+    /// a project file's value never stops a run.
+    checks: BTreeMap<Check, String>,
+    max_calls: Option<u32>,
+    /// Whether the file sets `judgments.rules`, which this build does
+    /// not run. The resolver decides by the file: a stop or a warning.
+    rules: bool,
 }
 
 /// The roles one `[theme.<name>]` table sets, in key order. `None`
@@ -270,6 +504,7 @@ pub struct Layer {
     themes: BTreeMap<String, ThemeKeys>,
     /// `prompt.base_file`.
     prompt_base_file: Option<String>,
+    judgments: JudgmentKeys,
 }
 
 impl Layer {
@@ -349,6 +584,17 @@ impl Layer {
                     }
                     other => {
                         return Err(format!("`theme` must be a table, not {}", other.type_str()));
+                    }
+                },
+                "judgments" => match value {
+                    toml::Value::Table(table) => {
+                        parse_judgments(table, &mut layer.judgments, &mut warnings)?;
+                    }
+                    other => {
+                        return Err(format!(
+                            "`judgments` must be a table, not {}",
+                            other.type_str()
+                        ));
                     }
                 },
                 "prompt" => match value {
@@ -500,6 +746,45 @@ fn parse_tui(
             "markdown" => into.markdown = Some(expect_bool(&path, value)?),
             "thinking" => into.thinking = Some(expect_thinking(&path, value)?),
             "theme" => into.theme = Some(expect_string(&path, value)?),
+            _ => warnings.push(format!("unknown key `{path}`")),
+        }
+    }
+    Ok(())
+}
+
+/// The `[judgments]` table. A check name that is not built in warns,
+/// like any unknown key. A check value parses as text, whatever its
+/// type: see [`JudgmentKeys::checks`].
+fn parse_judgments(
+    table: toml::Table,
+    into: &mut JudgmentKeys,
+    warnings: &mut Vec<String>,
+) -> Result<(), String> {
+    for (key, value) in table {
+        let path = format!("judgments.{key}");
+        match key.as_str() {
+            "instance" => into.instance = Some(expect_string(&path, value)?),
+            "max_calls" => into.max_calls = Some(expect_positive_u32(&path, value)?),
+            "checks" => {
+                let toml::Value::Table(checks) = value else {
+                    return Err(format!(
+                        "`{path}` must be a table, not {}",
+                        value.type_str()
+                    ));
+                };
+                for (name, value) in checks {
+                    let Some(check) = Check::from_name(&name) else {
+                        warnings.push(format!("unknown key `{path}.{name}`"));
+                        continue;
+                    };
+                    let raw = match value {
+                        toml::Value::String(text) => text,
+                        other => other.to_string(),
+                    };
+                    into.checks.insert(check, raw);
+                }
+            }
+            "rules" => into.rules = true,
             _ => warnings.push(format!("unknown key `{path}`")),
         }
     }
@@ -715,8 +1000,9 @@ impl Locations {
 /// must not raise privilege or move credentials. It cannot raise the
 /// approval mode, it cannot set an endpoint, it cannot turn the
 /// history file on against a user who turned it off, it cannot turn
-/// mouse capture on against a user who turned it off, and it cannot
-/// turn thinking on against a user who turned it off.
+/// mouse capture on against a user who turned it off, it cannot turn
+/// thinking on against a user who turned it off, and it cannot turn
+/// judgments on or raise a check or the judgment call cap.
 pub fn resolve(
     flags: &Flags,
     env: &dyn Fn(&str) -> Option<String>,
@@ -771,6 +1057,21 @@ fn resolve_layers(
     roles: bool,
 ) -> (Settings, Vec<String>) {
     let mut warnings = Vec::new();
+    // Trust rule: a project file cannot change the judge. The judge
+    // receives tool input and output, so every key of the project's
+    // table for the judge instance is ignored, with the warnings of
+    // `resolve_judgments`.
+    let judgments_project = project;
+    let judge_free;
+    let project = match (project, user.and_then(|l| l.judgments.instance.as_deref())) {
+        (Some(layer), Some(judge)) if layer.providers.contains_key(judge) => {
+            let mut layer = layer.clone();
+            layer.providers.remove(judge);
+            judge_free = layer;
+            Some(&judge_free)
+        }
+        _ => project,
+    };
     fn role_head(layer: &Layer, roles: bool) -> Option<&RoleTarget> {
         if roles { layer.role_head() } else { None }
     }
@@ -861,11 +1162,18 @@ fn resolve_layers(
     // provider's model with the active adapter. An adapter without a
     // default model takes a top-level `model` only from a layer that
     // names this instance: an older file's unscoped model id belongs
-    // to a shipped adapter.
+    // to a shipped adapter. A judge-only kind never takes it, even
+    // from a layer that names the instance: the top-level `model`
+    // names a model target's model.
     let lends_unscoped_model = kind
         .value
         .as_deref()
         .is_none_or(|kind| demerzel_providers::default_model(kind).is_some());
+    let judge_only = kind
+        .value
+        .as_deref()
+        .and_then(demerzel_providers::adapter_rules)
+        .is_some_and(|rules| !rules.serves_model);
     // A file's `[roles.default]` head pairs its provider with its
     // model, so its model wins in that file, and the top-level keys
     // of that file do not apply.
@@ -882,7 +1190,7 @@ fn resolve_layers(
                         .and_then(|p| p.model.clone())
                 })
                 .or_else(|| match &l.provider {
-                    _ if role_head.is_some() => None,
+                    _ if role_head.is_some() || judge_only => None,
                     Some(named) if *named != provider.value => None,
                     None if !lends_unscoped_model => None,
                     _ => l.model.clone(),
@@ -908,10 +1216,40 @@ fn resolve_layers(
         });
 
     // Trust rule: the project file cannot pick the endpoint requests
-    // — and the credentials on them — go to.
+    // — and the credentials on them — go to. The flag and the variable
+    // point the configured head elsewhere; a judge is never the head,
+    // so a judge key goes only to the judge's own endpoint.
     let flag_or_env_base_url = flag(&flags.base_url)
         .map(|v| Setting::new(v, Origin::Flag))
         .or_else(|| env(ENV_BASE_URL).map(|v| Setting::new(v, Origin::Env)));
+    let flag_or_env_base_url = match flag_or_env_base_url {
+        Some(setting) if judge_only => {
+            let own = layer_key(user, Origin::User, |l| {
+                l.providers
+                    .get(&provider.value)
+                    .and_then(|p| p.base_url.clone())
+            })
+            .map(|setting| setting.value)
+            .or_else(|| {
+                kind.value
+                    .as_deref()
+                    .and_then(demerzel_providers::default_base_url)
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "no endpoint".to_string());
+            let source = match setting.origin {
+                Origin::Flag => "--base-url",
+                _ => ENV_BASE_URL,
+            };
+            warnings.push(format!(
+                "ignored: {source} = {}; judge instance `{}` takes no endpoint override, so its \
+                 key and its requests go to {own}",
+                setting.value, provider.value
+            ));
+            None
+        }
+        other => other,
+    };
     let project_base_url = project.and_then(|l| {
         l.providers
             .get(&provider.value)
@@ -1178,6 +1516,9 @@ fn resolve_layers(
         .map(some_setting)
         .unwrap_or_else(|| Setting::new(None, Origin::Default));
 
+    let judgments = resolve_judgments(judgments_project, user);
+    warnings.extend(judgments.ignored.iter().cloned());
+
     (
         Settings {
             provider,
@@ -1200,9 +1541,133 @@ fn resolve_layers(
                 thinking,
                 theme,
             },
+            judgments,
         },
         warnings,
     )
+}
+
+/// The `[judgments]` keys under the trust rules. A judge receives tool
+/// input and output, and every request costs, so a project file, which
+/// travels with the repository, can only lower them:
+///
+/// - `instance`: only the user file sets it. A project value is
+///   ignored, with a warning.
+/// - `checks.<name>`: the user value, else `log`. A user value that is
+///   not valid is a problem that stops the run. A project value
+///   applies when it is valid and at or below the user's action;
+///   otherwise it is ignored, with a warning.
+/// - `max_calls`: the user value, else the default. A project value
+///   applies only when it is lower; otherwise it is ignored, with a
+///   warning.
+fn resolve_judgments(project: Option<&Layer>, user: Option<&Layer>) -> JudgmentSettings {
+    let mut ignored = Vec::new();
+    let mut problems = Vec::new();
+    if let Some(name) = project.and_then(|l| l.judgments.instance.as_deref()) {
+        ignored.push(format!(
+            "ignored: the project file sets judgments.instance = {name}; a project file \
+             cannot turn judgments on; set it in the user file"
+        ));
+    }
+    let instance = layer_key(user, Origin::User, |l| l.judgments.instance.clone())
+        .map(some_setting)
+        .unwrap_or_else(|| Setting::new(None, Origin::Default));
+    // A rule the user wrote to protect something must not do nothing
+    // without a word: this build runs no rules, so the run stops.
+    if user.is_some_and(|l| l.judgments.rules) {
+        problems.push(
+            "`judgments.rules` is not in this build: it runs only the built-in checks; remove \
+             the rules from the user file"
+                .to_string(),
+        );
+    }
+    if project.is_some_and(|l| l.judgments.rules) {
+        ignored.push(
+            "ignored: the project file sets judgments.rules; this build runs only the built-in \
+             checks"
+                .to_string(),
+        );
+    }
+    // A project file cannot change the judge: each key of its table
+    // for the judge instance is ignored. `resolve_layers` drops them.
+    if let Some(name) = instance.value.as_deref()
+        && let Some(keys) = project.and_then(|l| l.providers.get(name))
+    {
+        for (key, value) in keys.set_keys() {
+            ignored.push(format!(
+                "ignored: the project file sets providers.{name}.{key} = {value}; a project \
+                 file cannot change the judge instance; set it in the user file"
+            ));
+        }
+    }
+
+    let mut checks = BTreeMap::new();
+    for &check in Check::ALL {
+        let user_check = match user.and_then(|l| l.judgments.checks.get(&check)) {
+            Some(raw) => match raw.parse::<CheckAction>() {
+                Ok(action) => Some(Setting::new(action, Origin::User)),
+                Err(error) => {
+                    problems.push(format!("`judgments.checks.{check}` {error}"));
+                    None
+                }
+            },
+            None => None,
+        };
+        let baseline = user_check
+            .as_ref()
+            .map_or(DEFAULT_CHECK_ACTION, |setting| setting.value);
+        let project_check = match project.and_then(|l| l.judgments.checks.get(&check)) {
+            Some(raw) => match raw.parse::<CheckAction>() {
+                Ok(action) if action > baseline => {
+                    ignored.push(format!(
+                        "ignored: the project file sets judgments.checks.{check} = {action}; \
+                         a project file cannot raise a check above {baseline}; use the user file"
+                    ));
+                    None
+                }
+                Ok(action) => Some(Setting::new(action, Origin::Project)),
+                Err(error) => {
+                    ignored.push(format!(
+                        "ignored: the project file sets judgments.checks.{check} = {raw}; the \
+                         value {error}"
+                    ));
+                    None
+                }
+            },
+            None => None,
+        };
+        let action = project_check
+            .or(user_check)
+            .unwrap_or_else(|| Setting::new(DEFAULT_CHECK_ACTION, Origin::Default));
+        checks.insert(check, action);
+    }
+
+    let user_calls = layer_key(user, Origin::User, |l| l.judgments.max_calls);
+    let calls_baseline = user_calls
+        .as_ref()
+        .map_or(DEFAULT_JUDGE_MAX_CALLS, |setting| setting.value);
+    let project_calls = match layer_key(project, Origin::Project, |l| l.judgments.max_calls) {
+        Some(setting) if setting.value > calls_baseline => {
+            ignored.push(format!(
+                "ignored: the project file sets judgments.max_calls = {}; a project file \
+                 cannot raise the judgment call cap; use the user file",
+                setting.value
+            ));
+            None
+        }
+        other => other,
+    };
+    let max_calls = project_calls
+        .or(user_calls)
+        .unwrap_or_else(|| Setting::new(DEFAULT_JUDGE_MAX_CALLS, Origin::Default));
+
+    JudgmentSettings {
+        instance,
+        checks,
+        max_calls,
+        problems,
+        ignored,
+    }
 }
 
 /// One provider instance: the user file's table as `doctor` lists it,
@@ -1321,7 +1786,7 @@ pub fn chains(
                     chain.origin,
                     entry.provider,
                     entry.provider,
-                    demerzel_providers::PROVIDER_IDS.join(", ")
+                    model_adapters()
                 ));
                 continue;
             };
@@ -1370,10 +1835,13 @@ impl Instance {
 }
 
 /// The problems that stop a run on `instance` at boot, from the
-/// adapter's rules: an unknown adapter, a missing endpoint or model, a
-/// key variable or a thinking switch the adapter does not take, and a
-/// named instance that would carry the adapter's own credentials to an
-/// endpoint of its own. `Settings::problems` and the runtime's boot check share it.
+/// adapter's rules: an unknown adapter, a kind that serves only as a
+/// judge, a missing endpoint or model, a key variable or a thinking
+/// switch the adapter does not take, and a named instance that would
+/// carry the adapter's own credentials to an endpoint of its own.
+/// `Settings::problems` and the runtime's boot check share it, so it
+/// guards every model target: the head, each role target, the
+/// fallback tail, a `/model` switch, and a resumed session's instance.
 pub fn instance_problems(instance: &Instance) -> Vec<String> {
     let name = &instance.name;
     let kind = instance.kind.as_str();
@@ -1381,9 +1849,114 @@ pub fn instance_problems(instance: &Instance) -> Vec<String> {
         return vec![format!(
             "unknown provider `{name}`: define `[providers.{name}]` with a `kind` in the \
              user file, or use one of: {}",
-            demerzel_providers::PROVIDER_IDS.join(", ")
+            model_adapters()
         )];
     };
+    let mut problems = Vec::new();
+    // First, so a caller that reports one problem reports this one.
+    if !rules.serves_model {
+        problems.push(format!(
+            "provider `{name}` ({kind}) serves only as a judge; name it in \
+             `judgments.instance`, not as a model target"
+        ));
+    }
+    problems.extend(key_problems(instance, rules));
+    problems
+}
+
+/// The boot problems of a judge instance: an unknown adapter, a kind
+/// that cannot serve as a judge, and the key problems that
+/// [`instance_problems`] also reports: a missing endpoint or model, a
+/// key variable or a thinking switch the kind does not take.
+pub fn judge_problems(instance: &Instance) -> Vec<String> {
+    let name = &instance.name;
+    let kind = instance.kind.as_str();
+    let Some(rules) = demerzel_providers::adapter_rules(kind) else {
+        return vec![format!(
+            "unknown provider `{name}`: define `[providers.{name}]` with kind = {} in the \
+             user file",
+            judge_kinds()
+        )];
+    };
+    if !rules.serves_judge {
+        return vec![format!(
+            "provider `{name}` ({kind}) cannot serve as a judge: `judgments.instance` needs \
+             an instance of kind {}",
+            judge_kinds()
+        )];
+    }
+    key_problems(instance, rules)
+}
+
+/// The adapters that serve as a model provider, as a list: the
+/// names a provider error offers. A judge-only kind is not one.
+fn model_adapters() -> String {
+    let ids: Vec<&str> = demerzel_providers::PROVIDER_IDS
+        .iter()
+        .copied()
+        .filter(|id| demerzel_providers::adapter_rules(id).is_some_and(|r| r.serves_model))
+        .collect();
+    ids.join(", ")
+}
+
+/// The kinds that serve as a judge, as a phrase.
+fn judge_kinds() -> String {
+    let kinds: Vec<String> = demerzel_providers::PROVIDER_IDS
+        .iter()
+        .filter(|kind| demerzel_providers::adapter_rules(kind).is_some_and(|r| r.serves_judge))
+        .map(|kind| format!("`{kind}`"))
+        .collect();
+    kinds.join(" or ")
+}
+
+/// The judgments of the run: `Ok(None)` when the user file names no
+/// `judgments.instance`. `instances` is every configured instance,
+/// from [`run_instances`]. `Err` holds every problem that stops the
+/// run, one per line: a user-file check value that is not valid, an
+/// instance that config does not define, and each problem of
+/// [`judge_problems`].
+pub fn judgments(settings: &Settings, instances: &[Resolved]) -> Result<Option<Judgments>, String> {
+    let own = &settings.judgments;
+    let mut problems = own.problems.clone();
+    if let Some(name) = own.instance.value.as_deref() {
+        match instances
+            .iter()
+            .map(|resolved| &resolved.instance)
+            .find(|instance| instance.name == name)
+        {
+            Some(instance) => problems.extend(judge_problems(instance)),
+            None => problems.push(format!(
+                "`judgments.instance` names provider `{name}`, which the config does not \
+                 define: define `[providers.{name}]` with kind = {kinds} in the user file, or \
+                 use {kinds}",
+                kinds = judge_kinds()
+            )),
+        }
+    }
+    if !problems.is_empty() {
+        return Err(problems.join("\n"));
+    }
+    let Some(instance) = own.instance.value.clone() else {
+        return Ok(None);
+    };
+    let mut checks = Checks::uniform(DEFAULT_CHECK_ACTION);
+    for (&check, setting) in &own.checks {
+        checks.set(check, setting.value);
+    }
+    Ok(Some(Judgments {
+        instance,
+        checks,
+        max_calls: own.max_calls.value,
+    }))
+}
+
+/// The problems of an instance's keys under its adapter's rules: a
+/// missing endpoint or model, a key variable or a thinking switch the
+/// adapter does not take, and a named instance that would carry the
+/// adapter's own credentials to an endpoint of its own.
+fn key_problems(instance: &Instance, rules: demerzel_providers::AdapterRules) -> Vec<String> {
+    let name = &instance.name;
+    let kind = instance.kind.as_str();
     let mut problems = Vec::new();
     if rules.needs_endpoint && instance.base_url.is_none() {
         problems.push(format!(
@@ -2871,6 +3444,496 @@ mod tests {
         let (settings, _) = resolve(&Flags::default(), &no_env, None, Some(&user));
         let (_, problems) = resolved_chains(&settings, &Flags::default(), None, Some(&user));
         assert_eq!(problems.len(), 1, "{problems:?}");
+    }
+
+    /// A user file with a judge instance `judge` beside the shipped
+    /// adapters, and `extra` after it.
+    fn judge_user(extra: &str) -> Layer {
+        layer(&format!(
+            "[providers.judge]\nkind = \"typesafe\"\napi_key_env = \"JUDGE_KEY\"\n{extra}"
+        ))
+    }
+
+    #[test]
+    fn a_judge_only_instance_is_no_model_target() {
+        // The boot check refuses the kind itself, first, whatever
+        // else the instance sets.
+        let mut judge = Instance::new("judge", "typesafe");
+        judge.model = Some("jev-1.14.0".into());
+        let problems = instance_problems(&judge);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("`judge`"), "{problems:?}");
+        let implicit = Instance::new("typesafe", "typesafe");
+        assert_eq!(instance_problems(&implicit).len(), 1);
+
+        // `--provider` on the named and on the implicit instance.
+        let user = judge_user("");
+        for name in ["judge", "typesafe"] {
+            let flags = Flags {
+                provider: Some(name.into()),
+                ..Flags::default()
+            };
+            let settings = resolve_clean(&flags, &no_env, None, Some(&user));
+            let problems = settings.problems();
+            assert!(!problems.is_empty(), "{name}");
+            assert!(problems[0].contains(&format!("`{name}`")), "{problems:?}");
+        }
+    }
+
+    #[test]
+    fn a_role_that_names_a_judge_only_instance_stops_the_run() {
+        // A user role, as the head and as a tail target.
+        for chain in [
+            "[{ provider = \"judge\" }]",
+            "[{ provider = \"anthropic\" }, { provider = \"judge\" }]",
+            "[{ provider = \"typesafe\" }]",
+        ] {
+            let user = judge_user(&format!("[roles.fast]\nchain = {chain}"));
+            let (settings, warnings) = resolve(&Flags::default(), &no_env, None, Some(&user));
+            assert!(warnings.is_empty(), "{warnings:?}");
+            let (_, problems) = resolved_chains(&settings, &Flags::default(), None, Some(&user));
+            assert_eq!(problems.len(), 1, "{chain}: {problems:?}");
+        }
+        // A project role over a defined judge instance, named or
+        // implicit, stops the run too: `chains` checks every target,
+        // whatever file names it.
+        let user = judge_user("");
+        for name in ["judge", "typesafe"] {
+            let project = layer(&format!(
+                "[roles.default]\nchain = [{{ provider = \"{name}\" }}]"
+            ));
+            let (settings, warnings) =
+                resolve(&Flags::default(), &no_env, Some(&project), Some(&user));
+            assert!(warnings.is_empty(), "{warnings:?}");
+            assert_eq!(settings.roles[DEFAULT_ROLE].origin, Origin::Project);
+            let (_, problems) =
+                resolved_chains(&settings, &Flags::default(), Some(&project), Some(&user));
+            assert_eq!(problems.len(), 1, "{name}: {problems:?}");
+        }
+    }
+
+    #[test]
+    fn a_top_level_model_never_becomes_the_judges_model() {
+        // Neither beside another head, nor in a file that names the
+        // judge as its provider.
+        for top in [
+            "model = \"gpt-x\"",
+            "provider = \"anthropic\"\nmodel = \"gpt-x\"",
+            "provider = \"judge\"\nmodel = \"gpt-x\"",
+        ] {
+            let user = layer(&format!(
+                "{top}\n[providers.judge]\nkind = \"typesafe\"\napi_key_env = \"JUDGE_KEY\""
+            ));
+            // The judge keeps its adapter's default model.
+            let default = Some(demerzel_providers::typesafe::DEFAULT_MODEL);
+            for name in ["judge", "typesafe"] {
+                let resolved =
+                    resolve_instance(name, &Flags::default(), &no_env, None, Some(&user));
+                assert_eq!(resolved.instance.model.as_deref(), default, "{name}: {top}");
+            }
+        }
+        // The instance's own table names its model.
+        let user = judge_user("model = \"jev-1.13.0\"");
+        let resolved = resolve_instance("judge", &Flags::default(), &no_env, None, Some(&user));
+        assert_eq!(resolved.instance.model.as_deref(), Some("jev-1.13.0"));
+    }
+
+    /// The run's judgments under the two files, as `main` resolves
+    /// them, and the warnings of the resolution.
+    fn run_judgments(
+        project: Option<&Layer>,
+        user: Option<&Layer>,
+    ) -> (Result<Option<Judgments>, String>, Vec<String>) {
+        let (settings, warnings) = resolve(&Flags::default(), &no_env, project, user);
+        let instances = run_instances(&Flags::default(), &no_env, project, user);
+        (judgments(&settings, &instances), warnings)
+    }
+
+    /// The parse warnings of `text`, which must parse.
+    fn parse_warnings(text: &str) -> Vec<String> {
+        Layer::parse(text).unwrap().1
+    }
+
+    #[test]
+    fn each_check_defaults_to_log_and_off_keeps_the_others() {
+        let user = judge_user("[judgments]\ninstance = \"judge\"");
+        let (result, warnings) = run_judgments(None, Some(&user));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let judgments = result.unwrap().unwrap();
+        assert_eq!(judgments.instance, "judge");
+        assert_eq!(judgments.checks, Checks::uniform(CheckAction::Log));
+        assert_eq!(judgments.max_calls, 500);
+        assert_eq!(judgments.max_calls, DEFAULT_JUDGE_MAX_CALLS);
+
+        let user = judge_user(
+            "[judgments]\ninstance = \"judge\"\nmax_calls = 20\n\
+             checks = { progress = \"off\", claim = \"log\" }",
+        );
+        let settings = resolve_clean(&Flags::default(), &no_env, None, Some(&user));
+        let checks = &settings.judgments.checks;
+        assert_eq!(checks[&Check::Progress].origin, Origin::User);
+        assert_eq!(checks[&Check::Claim].origin, Origin::User);
+        assert_eq!(checks[&Check::Outcome].origin, Origin::Default);
+        assert_eq!(settings.judgments.max_calls.origin, Origin::User);
+        let (result, _) = run_judgments(None, Some(&user));
+        let judgments = result.unwrap().unwrap();
+        let mut expected = Checks::uniform(CheckAction::Log);
+        expected.set(Check::Progress, CheckAction::Off);
+        assert_eq!(judgments.checks, expected);
+        for &check in Check::ALL {
+            assert_eq!(judgments.checks.get(check), expected.get(check), "{check}");
+        }
+        assert_eq!(judgments.max_calls, 20);
+        // Off ranks below log.
+        assert!(CheckAction::Off < CheckAction::Log);
+    }
+
+    #[test]
+    fn without_a_judgments_instance_the_run_has_no_judgments() {
+        // No table at all: nothing else about the settings changes.
+        let user = layer(LOCAL);
+        let (result, warnings) = run_judgments(None, Some(&user));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(result, Ok(None));
+        let (result, _) = run_judgments(None, None);
+        assert_eq!(result, Ok(None));
+        // A judge instance alone, or checks without an instance, turn
+        // nothing on.
+        let user = judge_user("[judgments]\nchecks = { outcome = \"log\" }\nmax_calls = 9");
+        let (result, warnings) = run_judgments(None, Some(&user));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(result, Ok(None));
+    }
+
+    #[test]
+    fn a_project_file_cannot_turn_judgments_on() {
+        let user = judge_user("");
+        let project = layer("[judgments]\ninstance = \"judge\"");
+        let (result, warnings) = run_judgments(Some(&project), Some(&user));
+        assert_eq!(result, Ok(None));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("judgments.instance"), "{warnings:?}");
+        // Beside a user instance, the user's instance applies.
+        let user =
+            judge_user("[providers.other]\nkind = \"typesafe\"\n[judgments]\ninstance = \"other\"");
+        let project = layer("[judgments]\ninstance = \"judge\"");
+        let (result, warnings) = run_judgments(Some(&project), Some(&user));
+        assert_eq!(result.unwrap().unwrap().instance, "other");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+    }
+
+    #[test]
+    fn a_project_file_cannot_change_the_judge_instance() {
+        let user = judge_user("model = \"jev-1.14.0\"\n[judgments]\ninstance = \"judge\"");
+        let project = layer(
+            "[providers.judge]\n\
+             kind = \"openai-compat\"\n\
+             api_key_env = \"OTHER_KEY\"\n\
+             base_url = \"http://attacker.example\"\n\
+             model = \"jev-preview\"\n\
+             effort = \"low\"\n\
+             context_window = 1000\n\
+             thinking = \"off\"",
+        );
+        let (settings, warnings) = resolve(&Flags::default(), &no_env, Some(&project), Some(&user));
+        let keys = [
+            "kind",
+            "api_key_env",
+            "base_url",
+            "model",
+            "effort",
+            "context_window",
+            "thinking",
+        ];
+        // One warning per key, each among the judgments' ignored keys,
+        // and no other warning for the table.
+        assert_eq!(warnings.len(), keys.len(), "{warnings:?}");
+        for key in keys {
+            let warning = warnings
+                .iter()
+                .find(|w| w.contains(&format!("providers.judge.{key} ")))
+                .unwrap_or_else(|| panic!("{key}: {warnings:?}"));
+            assert!(settings.judgments.ignored.contains(warning), "{key}");
+        }
+        // The judge keeps the user file's keys alone.
+        let instances = run_instances(&Flags::default(), &no_env, Some(&project), Some(&user));
+        let judge = &instances
+            .iter()
+            .find(|resolved| resolved.instance.name == "judge")
+            .unwrap()
+            .instance;
+        let mut expected = Instance::new("judge", "typesafe");
+        expected.model = Some("jev-1.14.0".into());
+        expected.api_key_env = Some("JUDGE_KEY".into());
+        assert_eq!(*judge, expected);
+        let judge = &instances
+            .iter()
+            .find(|r| r.instance.name == "judge")
+            .unwrap();
+        assert_eq!(judge.effort_origin, Origin::Default);
+
+        // Another instance's project keys still apply.
+        let user = judge_user(
+            "[providers.local]\nkind = \"openai-compat\"\nbase_url = \"http://h/v1\"\n\
+             model = \"m1\"\n[judgments]\ninstance = \"judge\"",
+        );
+        let project = layer("[providers.local]\nmodel = \"m2\"");
+        let instances = run_instances(&Flags::default(), &no_env, Some(&project), Some(&user));
+        let local = instances
+            .iter()
+            .find(|r| r.instance.name == "local")
+            .unwrap();
+        assert_eq!(local.instance.model.as_deref(), Some("m2"));
+        // Without judgments, the table is an ordinary instance's.
+        let user = judge_user("model = \"jev-1.14.0\"");
+        let project = layer("[providers.judge]\nmodel = \"jev-preview\"");
+        let instances = run_instances(&Flags::default(), &no_env, Some(&project), Some(&user));
+        let judge = instances
+            .iter()
+            .find(|r| r.instance.name == "judge")
+            .unwrap();
+        assert_eq!(judge.instance.model.as_deref(), Some("jev-preview"));
+    }
+
+    #[test]
+    fn the_endpoint_flag_and_variable_never_reach_a_judge_instance() {
+        let env = |name: &str| (name == ENV_BASE_URL).then(|| "http://env.example".to_string());
+        let mut flags = Flags {
+            provider: Some("judge".into()),
+            ..Flags::default()
+        };
+        // `dmz login judge` resolves the instance as the provider.
+        let user = judge_user("base_url = \"http://judge.example\"");
+        let (settings, _) = resolve(&flags, &env, None, Some(&user));
+        assert_eq!(
+            settings.base_url.value.as_deref(),
+            Some("http://judge.example")
+        );
+        assert_eq!(settings.base_url.origin, Origin::User);
+        flags.base_url = Some("http://flag.example".into());
+        let (settings, warnings) = resolve(&flags, &env, None, Some(&user));
+        assert_eq!(
+            settings.base_url.value.as_deref(),
+            Some("http://judge.example")
+        );
+        // One warning names the dropped override and the endpoint.
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("http://flag.example")
+                && warnings[0].contains("http://judge.example"),
+            "{warnings:?}"
+        );
+        // Without a configured endpoint, none: the kind's default
+        // applies downstream.
+        let (settings, _) = resolve(&flags, &env, None, Some(&judge_user("")));
+        assert_eq!(settings.base_url.value, None);
+        let flags = Flags {
+            provider: Some("typesafe".into()),
+            base_url: Some("http://flag.example".into()),
+            ..Flags::default()
+        };
+        let (settings, _) = resolve(&flags, &env, None, None);
+        assert_eq!(settings.base_url.value, None);
+        // A model instance still takes them.
+        let flags = Flags {
+            provider: Some("local".into()),
+            ..Flags::default()
+        };
+        let user = layer("[providers.local]\nkind = \"openai-compat\"\nmodel = \"m\"");
+        let (settings, _) = resolve(&flags, &env, None, Some(&user));
+        assert_eq!(
+            settings.base_url.value.as_deref(),
+            Some("http://env.example")
+        );
+    }
+
+    #[test]
+    fn a_project_file_can_lower_a_check_or_the_cap_but_not_raise_them() {
+        let user = judge_user(
+            "[judgments]\ninstance = \"judge\"\nmax_calls = 100\n\
+             checks = { outcome = \"off\" }",
+        );
+        // Raising: each value is ignored with a warning.
+        let project = layer("[judgments]\nmax_calls = 200\nchecks = { outcome = \"log\" }");
+        let (result, warnings) = run_judgments(Some(&project), Some(&user));
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("judgments.checks.outcome")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("judgments.max_calls")),
+            "{warnings:?}"
+        );
+        let judgments = result.unwrap().unwrap();
+        assert_eq!(judgments.checks.outcome, CheckAction::Off);
+        assert_eq!(judgments.max_calls, 100);
+        // Without user values, the defaults are the ceiling.
+        let project = layer("[judgments]\nmax_calls = 501");
+        let (result, warnings) = run_judgments(
+            Some(&project),
+            Some(&judge_user("[judgments]\ninstance = \"judge\"")),
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(result.unwrap().unwrap().max_calls, DEFAULT_JUDGE_MAX_CALLS);
+
+        // Lowering applies, and an equal value is no raise.
+        let project = layer(
+            "[judgments]\nmax_calls = 50\n\
+             checks = { progress = \"off\", claim = \"log\", outcome = \"off\" }",
+        );
+        let settings = resolve_clean(&Flags::default(), &no_env, Some(&project), Some(&user));
+        assert_eq!(settings.judgments.max_calls.value, 50);
+        assert_eq!(settings.judgments.max_calls.origin, Origin::Project);
+        let checks = &settings.judgments.checks;
+        assert_eq!(checks[&Check::Progress].value, CheckAction::Off);
+        assert_eq!(checks[&Check::Progress].origin, Origin::Project);
+        assert_eq!(checks[&Check::Claim].value, CheckAction::Log);
+        assert_eq!(checks[&Check::Claim].origin, Origin::Project);
+        assert_eq!(checks[&Check::Outcome].value, CheckAction::Off);
+        let (result, _) = run_judgments(Some(&project), Some(&user));
+        let judgments = result.unwrap().unwrap();
+        assert_eq!(judgments.max_calls, 50);
+        assert_eq!(judgments.checks.progress, CheckAction::Off);
+        assert_eq!(judgments.checks.approval, CheckAction::Log);
+    }
+
+    #[test]
+    fn a_user_check_value_outside_off_and_log_stops_the_run() {
+        for value in ["\"warn\"", "\"act\"", "\"note\"", "\"LOG\"", "1", "true"] {
+            let text =
+                format!("[judgments]\ninstance = \"judge\"\nchecks = {{ outcome = {value} }}");
+            // The parse takes the value; the resolution refuses it.
+            let user = judge_user(&text);
+            let (result, warnings) = run_judgments(None, Some(&user));
+            assert!(warnings.is_empty(), "{value}: {warnings:?}");
+            let error = result.unwrap_err();
+            for part in ["judgments.checks.outcome", "`off`", "`log`"] {
+                assert!(error.contains(part), "{value}: {error}");
+            }
+            // Without an instance, the value still stops the run: the
+            // user file has an error.
+            let user = layer(&format!("[judgments]\nchecks = {{ claim = {value} }}"));
+            let (result, _) = run_judgments(None, Some(&user));
+            assert!(result.is_err(), "{value}");
+        }
+    }
+
+    #[test]
+    fn a_project_check_value_outside_off_and_log_is_ignored_with_a_warning() {
+        let user = judge_user("[judgments]\ninstance = \"judge\"\nchecks = { claim = \"off\" }");
+        for value in ["\"warn\"", "\"act\"", "\"\"", "2"] {
+            let project = layer(&format!(
+                "[judgments]\nchecks = {{ outcome = {value}, claim = {value} }}"
+            ));
+            let (result, warnings) = run_judgments(Some(&project), Some(&user));
+            assert_eq!(warnings.len(), 2, "{value}: {warnings:?}");
+            assert!(
+                warnings
+                    .iter()
+                    .all(|w| w.contains("`off`") && w.contains("`log`")),
+                "{value}: {warnings:?}"
+            );
+            let judgments = result.unwrap().unwrap();
+            assert_eq!(judgments.checks.outcome, CheckAction::Log);
+            assert_eq!(judgments.checks.claim, CheckAction::Off);
+        }
+    }
+
+    #[test]
+    fn judgment_rules_stop_the_run_in_the_user_file_and_warn_in_a_project_file() {
+        let rules = "[[judgments.rules]]\nevent = \"tool_before\"\nask = \"x\"\naction = \"deny\"";
+        // In the user file, the run stops, with or without an instance.
+        for extra in ["", "[judgments]\ninstance = \"judge\"\n"] {
+            let user = judge_user(&format!("{extra}{rules}"));
+            let (result, warnings) = run_judgments(None, Some(&user));
+            let error = result.unwrap_err();
+            assert!(error.contains("judgments.rules"), "{error}");
+            assert!(warnings.is_empty(), "{warnings:?}");
+        }
+        // In a project file, a warning; the run goes on.
+        let user = judge_user("[judgments]\ninstance = \"judge\"");
+        let project = layer(rules);
+        let (result, warnings) = run_judgments(Some(&project), Some(&user));
+        assert_eq!(result.unwrap().unwrap().instance, "judge");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("judgments.rules"), "{warnings:?}");
+    }
+
+    #[test]
+    fn unknown_judgment_keys_and_check_names_warn_in_either_file() {
+        let warnings = parse_warnings(
+            "[judgments]\ninstance = \"judge\"\nchecks = { bogus = \"log\", outcome = \"off\" }\n\
+             [[judgments.rules]]\nask = \"x\"",
+        );
+        // The rules are the resolver's to judge, by the file.
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("`judgments.checks.bogus`"))
+        );
+        // The parse is the same for a project file: the name warns,
+        // and the known check keeps its value.
+        let (project, warnings) =
+            Layer::parse("[judgments]\nchecks = { bogus = \"warn\", outcome = \"off\" }").unwrap();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let user = judge_user("[judgments]\ninstance = \"judge\"");
+        let (result, warnings) = run_judgments(Some(&project), Some(&user));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(result.unwrap().unwrap().checks.outcome, CheckAction::Off);
+    }
+
+    #[test]
+    fn judgment_keys_refuse_bad_shapes() {
+        for text in [
+            "judgments = 1",
+            "[judgments]\ninstance = 1",
+            "[judgments]\ninstance = \"\"",
+            "[judgments]\nmax_calls = 0",
+            "[judgments]\nmax_calls = \"5\"",
+            "[judgments]\nchecks = \"log\"",
+        ] {
+            assert!(Layer::parse(text).is_err(), "{text}");
+        }
+    }
+
+    #[test]
+    fn the_judge_must_be_a_defined_instance_of_a_judge_kind() {
+        let refused = |user: &Layer, name: &str| {
+            let (result, _) = run_judgments(None, Some(user));
+            let error = result.unwrap_err();
+            assert!(error.contains(&format!("`{name}`")), "{error}");
+        };
+        // Undefined.
+        refused(&judge_user("[judgments]\ninstance = \"ghost\""), "ghost");
+        // A model adapter's instance, named or implicit.
+        let user = layer(&format!("{LOCAL}\n[judgments]\ninstance = \"local\""));
+        refused(&user, "local");
+        refused(&layer("[judgments]\ninstance = \"anthropic\""), "anthropic");
+        // A judge instance with a key the kind does not take.
+        refused(
+            &judge_user("thinking = \"off\"\n[judgments]\ninstance = \"judge\""),
+            "judge",
+        );
+        // The implicit judge instance needs no table.
+        let (result, _) = run_judgments(None, Some(&layer("[judgments]\ninstance = \"typesafe\"")));
+        assert_eq!(result.unwrap().unwrap().instance, "typesafe");
+    }
+
+    #[test]
+    fn judge_problems_check_a_judge_and_instance_problems_a_model_target() {
+        let mut judge = Instance::new("judge", "typesafe");
+        assert!(judge_problems(&judge).is_empty());
+        judge.api_key_env = Some("JUDGE_KEY".into());
+        judge.base_url = Some("http://127.0.0.1:9".into());
+        assert!(judge_problems(&judge).is_empty());
+        assert_eq!(instance_problems(&judge).len(), 1);
+        let local = Instance::new("local", "openai-compat");
+        assert_eq!(judge_problems(&local).len(), 1);
+        assert_eq!(judge_problems(&Instance::new("x", "")).len(), 1);
     }
 
     #[test]

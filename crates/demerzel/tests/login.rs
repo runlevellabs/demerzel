@@ -4,9 +4,11 @@
 
 use std::path::Path;
 
-use demerzel::login::{CodexFlow, Options};
+use demerzel::config::{self, Flags, Layer, Origin};
+use demerzel::login::{CodexFlow, Method, Options, method};
 use demerzel_mock::MockServer;
 use demerzel_providers::auth::AuthStore;
+use demerzel_providers::typesafe;
 use serde_json::json;
 
 fn options(dir: &Path, mock: &MockServer) -> Options {
@@ -151,4 +153,50 @@ async fn a_taken_port_falls_through_to_the_next() {
     let flow = CodexFlow::start(&options).await.unwrap();
     assert!(flow.listening());
     assert_ne!(flow.port(), taken_port);
+}
+
+/// The login method for instance `name` under the user file `user`,
+/// resolved the way `dmz login <name>` resolves it.
+fn method_for(name: &str, user: &str) -> Result<Method, demerzel::RunError> {
+    let (user, _) = Layer::parse(user).unwrap();
+    let flags = Flags {
+        provider: Some(name.to_string()),
+        ..Flags::default()
+    };
+    let (settings, _) = config::resolve(&flags, &|_| None, None, Some(&user));
+    method(&settings)
+}
+
+#[test]
+fn a_judge_login_without_an_endpoint_checks_at_the_kinds_default() {
+    // Resolution only: no request leaves the test.
+    let expected = |name: &str| Method::Instance {
+        name: name.into(),
+        kind: typesafe::PROVIDER_ID.into(),
+        base_url: typesafe::DEFAULT_BASE_URL.into(),
+        origin: Origin::Default,
+    };
+    let user = "[providers.judge]\nkind = \"typesafe\"\nmodel = \"jev-1.14.0\"";
+    assert_eq!(method_for("judge", user).unwrap(), expected("judge"));
+    // The implicit instance needs no table.
+    assert_eq!(method_for("typesafe", "").unwrap(), expected("typesafe"));
+}
+
+#[test]
+fn a_judge_login_takes_the_configured_endpoint_and_refuses_a_key_variable() {
+    let user = "[providers.judge]\nkind = \"typesafe\"\nbase_url = \"http://127.0.0.1:9\"";
+    assert_eq!(
+        method_for("judge", user).unwrap(),
+        Method::Instance {
+            name: "judge".into(),
+            kind: typesafe::PROVIDER_ID.into(),
+            base_url: "http://127.0.0.1:9".into(),
+            origin: Origin::User,
+        }
+    );
+    // The variable wins over the store, so a stored key would never
+    // serve the instance.
+    let user = "[providers.judge]\nkind = \"typesafe\"\napi_key_env = \"DMZ_TEST_JUDGE_KEY\"";
+    let error = method_for("judge", user).unwrap_err().to_string();
+    assert!(error.contains("DMZ_TEST_JUDGE_KEY"), "{error}");
 }

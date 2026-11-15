@@ -12,6 +12,7 @@ their source code. Demerzel does not copy code from other projects.
 | [jcode](https://github.com/1jehuang/jcode) | MIT | The performance bar: boot time and PSS as product features. The memory-system feature set. Benchmark reports cite its published numbers as the comparison target. |
 | [Pi coding agent](https://github.com/earendil-works/pi) | MIT | The small-defaults philosophy: a small tool set, a small prompt, and opt-in capabilities. The fully replaceable system prompt. |
 | [Claude Code memory](https://code.claude.com/docs/en/memory) | proprietary | The `MEMORY.md` persistent-memory pattern, as a concept reference only. |
+| [TypeSafe System One API](https://docs.typesafe.ai/api/system-one) | proprietary | The wire contract of the `typesafe` judge kind: the System One request and reply, the yes-or-no answer type, the models route for the key check, and the status codes. Reimplemented from the published API reference and its OpenAPI spec. |
 
 The design context for each credit lives in [`plan.md`](plan.md). The
 milestone plans record where a scheme was adopted and what changed in

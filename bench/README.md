@@ -174,6 +174,8 @@ transcript, and an oracle. The runner serves the transcript from
 checks two things:
 
 1. The mock used every reply of the transcript and refused no request.
+   For a judged task, the mock also answered exactly the number of
+   judge requests that the transcript expects.
 2. The oracle accepts the final state of the files.
 
 The mock serves the replies in request order. Thus a prompt change does
@@ -191,6 +193,8 @@ The smoke run does not prove these things:
   message. The mock does not check them.
 - The failure of a call that must fail. Such a call proves only that
   it changed nothing. A call to a missing tool passes the same way.
+- The state in a judge request. The mock checks only the bearer key,
+  the model, the question ids, and the question types.
 
 The runner needs Python 3.11 or newer. Run it after a release build:
 
@@ -221,7 +225,8 @@ stdout, and the mock's stderr. The stages are:
   status other than 0.
 - `timeout`: the one-shot run did not end in 30 seconds.
 - `mock count`: the mock reports an unused reply or a refused request,
-  or its count line is missing or malformed.
+  or its count line is missing or malformed. For a judged task, the
+  count of judge requests differs from the transcript's `requests`.
 - `oracle`: the oracle did not start, or it exited with a status other
   than 0.
 - `oracle timeout`: the oracle did not end in 30 seconds.
@@ -246,6 +251,30 @@ what each final state proves:
 | `parallel-edits` | Two parallel `edit` calls in one reply each changed their own file. The two parallel `read` calls before them leave no trace in the files. |
 | `recover-from-failures` | `check.before` holds the output and exit status 1 of the first check. The `edit` with a stale tag changed nothing. The `edit` with the correct tag wrote `version = 2`. `check.after` holds the output and exit status 0 of the second check. |
 | `project-config` | The run used the mock. The project config file names another provider, model, and endpoint. |
+| `judged-run` | The checks at `log` changed no file: `test.out` holds exit status 0, `mode.txt` says `strict`, and `lint.out` holds two runs with exit status 1. The mock answered 7 judge requests and refused none, so each request carried the judge model of the run's config. The oracle also reads the session file; see below. |
+
+A `judged-run` run sends 7 judge requests:
+
+1. The `test.sh` run: `approval` before it, and `outcome` after it,
+   because it returns without its error flag.
+2. The `edit`: `approval` before it. An edit does not execute, so
+   `outcome` does not ask.
+3. The first `lint.sh` run: `approval` before it. It fails, so
+   `outcome` does not ask. No earlier `bash` call failed, so
+   `progress` does not ask.
+4. The second `lint.sh` run: `approval` before it, and `progress`
+   after it, because the first run failed.
+5. The text reply: `claim` at the end of the turn.
+
+The task's oracle, `judgments.py`, reads the session file under the
+scratch data directory. It checks these things:
+
+- The file holds one `judgment` record for each judge request.
+- The records hold the events, the call ids, and the checks above.
+- No record has an `error`.
+- Each record has the scripted model and answers.
+- The `call_id` of each `tool_before` record equals the `tool_use_id`
+  of an `approval` record.
 
 If the harness accepts the stale tag, `version.txt` holds `version = 3`,
 and the next `edit` fails on its own tag. Each scripted `bash` call
@@ -276,10 +305,10 @@ directory, so a task must not depend on the secrecy of these files.
 ### The formats
 
 The runner's validator owns the three formats. The mock's parser only
-maps each reply to the wire. Each format has `schema: 1`. Schema 1 grows
-by optional fields. A reader refuses a field that it does not know. The
-number changes only when a field changes its meaning or becomes
-required.
+maps each reply and each judge answer to the wire. Each format has
+`schema: 1`. Schema 1 grows by optional fields. A reader refuses a
+field that it does not know. The number changes only when a field
+changes its meaning or becomes required.
 
 `--check` and each run refuse these:
 
@@ -309,9 +338,10 @@ A directory with a name that starts with `.` is not a task.
 - `name`: the task directory. It holds letters, digits, `.`, `_`, and
   `-`. The first character is a letter or a digit.
 - `source_step`: the origin of the task. A public task gives
-  `synthetic`. A bank task gives `m<milestone>-<step>`: the milestone
-  and the plan step whose dogfood found the failure. Examples: `m3-7`,
-  `m3-8a`, and `m2.5-8f`.
+  `synthetic`, or the plan step that added the feature it checks.
+  A bank task gives `m<milestone>-<step>`: the milestone and the plan
+  step whose dogfood found the failure. Examples: `m3-7`, `m3-8a`, and
+  `m2.5-8f`.
 - `summary`: one line about what the task checks.
 
 `task.json` is the scenario document of a task. Later steps extend it
@@ -354,7 +384,58 @@ The runner accepts one shape only: replies with tool calls, then one
 text reply as the last reply. This shape is an early check. The proof
 that the run used every reply is the mock's count. The mock serves
 until its stdin closes. Then it prints the count of served replies,
-unused replies, and refused requests.
+unused replies, and refused requests:
+`{"served":5,"unused":0,"refused":0}`.
+
+A transcript can also script a judge. The optional `judge` member
+makes the task a judged task:
+
+```json
+{"schema": 1, "replies": [
+  {"tool_calls": [{"id": "call_1", "name": "create",
+                   "input": {"path": "docs/usage.txt", "content": "Usage.\n"}}]},
+  {"text": "Done."}
+ ],
+ "judge": {"model": "jev-1.14.0", "requests": 2,
+           "answers": {"approval.destructive": {"type": "noul", "noul": 0.02},
+                       "approval.in_scope": {"type": "noul", "noul": 0.97},
+                       "claim": {"type": "noul", "noul": 0.1}}}}
+```
+
+This run sends two judge requests: the `approval` check before the
+`create` call, and the `claim` check at the end of the turn.
+
+- `model`: the model id that each judge request must carry, and the
+  model id of each judge reply. A non-empty string.
+- `requests`: the number of judge requests that the task expects. A
+  non-negative integer. The runner compares it with the mock's count.
+- `answers`: one answer for each question id, in the wire shape of
+  its type. A non-empty object. The three types and their members:
+  1. `noul`: `type` and `noul`, a number.
+  2. `choice`: `type`, `choice`, `probabilities`, and `confidence`.
+     `probabilities` is an object of numbers by option name.
+  3. `score`: `type`, `score`, `probabilities`, `confidence`, and
+     `legend`. `probabilities` is an object of numbers by level, with
+     the keys `"0"` to `"n-1"`. `legend` has one string for each level.
+
+The built-in checks ask yes-or-no questions, so they need `noul`
+answers. Their question ids are `approval.destructive`,
+`approval.in_scope`, `outcome`, `progress`, and `claim`; see
+[Judgments](../docs/config.md#judgments).
+
+A judged task's mock also serves `POST <base>/judge/v1/systemone`. It
+answers each question by its id. The mock refuses these judge requests
+and counts them as refused:
+
+- a request without a bearer key;
+- a request with a `model` other than the transcript's `judge.model`;
+- a request with a question id that `answers` does not hold;
+- a request with a question of another type than its answer.
+
+The count line of a judged task has a fourth key, the count of
+answered judge requests: `{"served":5,"unused":0,"refused":0,"judged":7}`.
+A count line with `judged` for a task without `judge` is malformed. So
+is a count line without `judged` for a judged task.
 
 Each `input` must match the input schema of its tool. The `edit` tool
 takes the snapshot tag of the file. The tag depends only on the bytes
@@ -373,10 +454,15 @@ Each task runs in a fresh scratch directory:
    variable of the parent and each provider key stays out.
 4. A user config file in the scratch config directory defines the
    `smoke` instance, with `kind = "openai-compat"` and the mock's
-   URL. The mock needs no key, so the instance sends none.
+   URL. The mock needs no key, so the instance sends none. For a
+   judged task, the file also defines the `judge` instance, with
+   `kind = "typesafe"`, the mock's judge URL, the transcript's judge
+   model, and `api_key_env = "SMOKE_JUDGE_KEY"`. The file sets
+   `[judgments] instance = "judge"`, so every check runs at `log`.
 5. The runner runs `demerzel --auto -- <prompt>` in the copy, with
    `DEMERZEL_PROVIDER=smoke`, `DEMERZEL_MODEL=scripted`, and
-   `DEMERZEL_BASE_URL` set to the mock. The session file goes to the
+   `DEMERZEL_BASE_URL` set to the mock. For a judged task,
+   `SMOKE_JUDGE_KEY` holds a fake key. The session file goes to the
    scratch data directory.
 6. The runner closes the mock's stdin, reads the count, and stops the
    mock. Then it runs the oracle and removes the scratch directory.

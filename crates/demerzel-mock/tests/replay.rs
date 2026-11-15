@@ -1,6 +1,7 @@
 //! The `demerzel-mock` binary: the stdout lines, replay order, the
 //! stream a two-call reply serves, the tool-result check, the routes
-//! that take a reply, and refusal of a bad transcript.
+//! that take a reply, the judge route of a `judge` member, and refusal
+//! of a bad transcript.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -68,14 +69,28 @@ impl Mock {
 
     /// One HTTP/1.1 request; the status and the body.
     fn request(&self, method: &str, path: &str, body: &Value) -> (u16, String) {
+        self.request_with(method, path, None, body)
+    }
+
+    /// One HTTP/1.1 request with an optional bearer key.
+    fn request_with(
+        &self,
+        method: &str,
+        path: &str,
+        key: Option<&str>,
+        body: &Value,
+    ) -> (u16, String) {
         let addr = self.url.strip_prefix("http://").expect("an http base URL");
         let mut stream = TcpStream::connect(addr).unwrap();
         stream.set_read_timeout(Some(WAIT)).unwrap();
         stream.set_write_timeout(Some(WAIT)).unwrap();
         let body = body.to_string();
+        let auth = key.map_or(String::new(), |key| {
+            format!("Authorization: Bearer {key}\r\n")
+        });
         write!(
             stream,
-            "{method} {path} HTTP/1.1\r\nHost: {addr}\r\n\
+            "{method} {path} HTTP/1.1\r\nHost: {addr}\r\n{auth}\
              Content-Type: application/json\r\nContent-Length: {}\r\n\
              Connection: close\r\n\r\n{body}",
             body.len()
@@ -96,6 +111,17 @@ impl Mock {
         self.request("POST", "/v1/chat/completions", body)
     }
 
+    /// One judge request that asks the yes-or-no questions `ids`.
+    fn judge(&self, key: Option<&str>, ids: &[&str]) -> (u16, Value) {
+        let questions: serde_json::Map<String, Value> = ids
+            .iter()
+            .map(|id| (id.to_string(), json!({"type": "noul", "instructions": "q"})))
+            .collect();
+        let body = json!({"model": "judge-9.9.9", "state": "s", "questions": questions});
+        let (status, body) = self.request_with("POST", JUDGE_ROUTE, key, &body);
+        (status, serde_json::from_str(&body).unwrap_or(Value::Null))
+    }
+
     /// Close stdin; the summary line and the exit status.
     fn finish(mut self) -> (String, ExitStatus) {
         drop(self.stdin.take());
@@ -111,6 +137,12 @@ impl Mock {
         (line, status)
     }
 }
+
+/// The judge route of the binary.
+const JUDGE_ROUTE: &str = "/judge/v1/systemone";
+
+/// A clearly fake bearer key.
+const KEY: Option<&str> = Some("fake-judge-key");
 
 /// The exact summary line for these counts.
 fn summary(served: u64, unused: u64, refused: u64) -> String {
@@ -369,5 +401,96 @@ fn arguments_other_than_one_path_are_refused() {
     for flag in ["-h", "--help"] {
         let output = Command::new(BIN).arg(flag).output().unwrap();
         assert!(output.status.success(), "{flag}");
+    }
+}
+
+fn judged_script(judge: Value) -> Value {
+    json!({"schema": 1, "replies": [{"text": "one"}], "judge": judge})
+}
+
+fn judge_member() -> Value {
+    json!({
+        "model": "judge-9.9.9",
+        "requests": 2,
+        "answers": {
+            "outcome": {"type": "noul", "noul": 0.25},
+            "claim": {"type": "noul", "noul": 0.75},
+        },
+    })
+}
+
+#[test]
+fn a_judge_member_answers_by_id_and_counts_judged_requests() {
+    let path = transcript("judged", &judged_script(judge_member()));
+    let mock = Mock::start(&path);
+    let (status, reply) = mock.judge(KEY, &["outcome"]);
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(reply["model"], "judge-9.9.9");
+    assert_eq!(
+        reply["answers"],
+        json!({"outcome": {"type": "noul", "noul": 0.25}})
+    );
+    let (status, reply) = mock.judge(KEY, &["outcome", "claim"]);
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(
+        reply["answers"]["claim"],
+        json!({"type": "noul", "noul": 0.75})
+    );
+    // No bearer key, and a question without a scripted answer: both
+    // refused, neither judged.
+    assert_eq!(mock.judge(None, &["outcome"]).0, 401);
+    assert_eq!(mock.judge(KEY, &["outcome", "progress"]).0, 422);
+    // The model route is unchanged.
+    assert_eq!(text_of(&mock.chat(&first()).1), "one");
+    let (line, status) = mock.finish();
+    assert!(status.success(), "{status}");
+    assert_eq!(line, r#"{"served":1,"unused":0,"refused":2,"judged":2}"#);
+}
+
+#[test]
+fn without_a_judge_member_the_judge_route_is_refused_and_the_line_keeps_three_keys() {
+    let path = transcript("unjudged", &script(json!([{"text": "one"}])));
+    let mock = Mock::start(&path);
+    assert_eq!(mock.judge(KEY, &["outcome"]).0, 404);
+    let (line, status) = mock.finish();
+    assert!(status.success(), "{status}");
+    assert_eq!(line, summary(0, 1, 1));
+}
+
+#[test]
+fn a_bad_judge_member_fails_before_the_url_line() {
+    let noul = json!({"type": "noul", "noul": 0.5});
+    let mut cases = Vec::new();
+    for (field, value) in [
+        ("extra", json!(1)),
+        ("answers", json!([noul])),
+        ("answers", json!({})),
+        ("answers", json!({"outcome": "yes"})),
+        (
+            "answers",
+            json!({"outcome": {"type": "noul", "noul": 0.5, "extra": 1}}),
+        ),
+        (
+            "answers",
+            json!({"outcome": {"type": "yes_no", "yes": 0.5}}),
+        ),
+        ("requests", json!(-1)),
+        ("requests", json!(1.5)),
+        ("model", json!("")),
+    ] {
+        let mut judge = judge_member();
+        judge[field] = value;
+        cases.push(judge);
+    }
+    let mut no_model = judge_member();
+    no_model.as_object_mut().unwrap().remove("model");
+    cases.extend([no_model, Value::Null, json!([])]);
+    for (index, judge) in cases.into_iter().enumerate() {
+        let path = transcript(&format!("bad-judge-{index}"), &judged_script(judge.clone()));
+        let output = Command::new(BIN).arg(&path).output().unwrap();
+        assert!(!output.status.success(), "accepted {judge}");
+        assert!(output.stdout.is_empty(), "{judge}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("judge"), "{judge}: {stderr}");
     }
 }

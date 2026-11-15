@@ -71,7 +71,8 @@ enum Command {
     Login {
         /// openai-codex (the browser flow, the default), anthropic (an
         /// API key, prompted and verified), or the name of an
-        /// openai-compat or openai-responses instance (its API key).
+        /// openai-compat, openai-responses, or typesafe instance (its
+        /// API key).
         #[arg(value_name = "PROVIDER")]
         provider: Option<String>,
     },
@@ -155,16 +156,25 @@ fn main() {
             Ok(harness) => harness,
             Err(error) => return Some(Err(error)),
         };
+        // One interrupt stream for the whole run: a Ctrl-C between the
+        // turn and the exit wait stays queued for the wait.
+        let mut sigint =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).ok();
         let renderer = Renderer::new(false);
         let result = {
             let run = harness.one_shot(prompt, &renderer);
             tokio::pin!(run);
             tokio::select! {
                 result = &mut run => Some(result),
-                _ = tokio::signal::ctrl_c() => None,
+                () = interrupted(&mut sigint) => None,
             }
         };
         renderer.finish();
+        // The turn ended: its judgment records land before the exit,
+        // and a Ctrl-C during that wait keeps the turn's exit status.
+        if result.is_some() {
+            harness.settle_at_exit_or(interrupted(&mut sigint)).await;
+        }
         result
     });
 
@@ -299,14 +309,32 @@ fn login_options(
     let user = load_layer(locations.user.as_deref())?;
     let mut flags = cli.flags();
     flags.provider = Some(provider.to_string());
-    let (settings, _) = config::resolve(
+    let (settings, warnings) = config::resolve(
         &flags,
         &|name| std::env::var(name).ok(),
         None,
         user.as_ref(),
     );
     let method = login::method(&settings).map_err(|error| error.to_string())?;
+    // Say which override the login dropped: an endpoint flag or
+    // variable never moves a judge key.
+    if matches!(method, login::Method::Instance { .. }) {
+        for warning in &warnings {
+            eprintln!("demerzel: {warning}");
+        }
+    }
     Ok((method, options))
+}
+
+/// The next Ctrl-C on `sigint`; never, without a stream, so the
+/// waits keep their own bounds and `settle_at_exit` its own watch.
+async fn interrupted(sigint: &mut Option<tokio::signal::unix::Signal>) {
+    match sigint {
+        Some(sigint) => {
+            sigint.recv().await;
+        }
+        None => std::future::pending().await,
+    }
 }
 
 /// Resolve flags, environment, and config files into the run config.
@@ -361,6 +389,9 @@ fn run_config(cli: &Cli, cwd: PathBuf) -> Result<RunConfig, String> {
     if !problems.is_empty() {
         return Err(problems.join("\n"));
     }
+    // A judgments setting that cannot run stops the run here too.
+    // Without `judgments.instance`, nothing changes.
+    config.judgments = config::judgments(&settings, &instances)?;
     // The run's head keeps its own resolution, with the flags.
     config.other_instances = instances
         .into_iter()

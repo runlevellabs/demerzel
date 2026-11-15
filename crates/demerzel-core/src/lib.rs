@@ -6,6 +6,8 @@
 
 mod approval;
 mod engine;
+mod host;
+mod judge;
 mod message;
 pub mod paths;
 mod provider;
@@ -18,13 +20,20 @@ pub use engine::{
     ApprovalAnswer, Approver, DEFAULT_MAX_MODEL_CALLS, DEFAULT_SYSTEM_PROMPT, Engine, EngineConfig,
     EngineError, EngineEvent, EngineParts, EventSink, NoPrompt, TurnOutcome,
 };
+pub use host::{
+    CallSeen, HostReply, LoopHost, ToolAfter, ToolBefore, ToolGate, TurnEnd, TurnEndOutcome,
+    TurnStart, TurnView,
+};
+pub use judge::{
+    Answer, Judge, JudgeError, JudgeReply, JudgeRequest, JudgeUsage, Question, check_reply,
+};
 pub use message::{ContentBlock, Message, Role, SealedPayload, StopReason, Usage};
 pub use provider::{
     Capabilities, Effort, EventStream, Provider, ProviderError, Request, StreamEvent,
 };
 pub use route::{ProviderHost, Route, SingleProvider, Target};
 pub use session::{
-    Replay, ReplayToolClock, ReplayUsage, SCHEMA_VERSION, Session, SessionMeta, SessionOpen,
-    SessionRecord, SessionStore, Timing, replay,
+    JudgmentRecord, Replay, ReplayToolClock, ReplayUsage, SCHEMA_VERSION, Session, SessionMeta,
+    SessionOpen, SessionRecord, SessionStore, SessionWriter, Timing, replay,
 };
 pub use tool::{BoxFuture, ToolDefinition, ToolHost, ToolOutput};

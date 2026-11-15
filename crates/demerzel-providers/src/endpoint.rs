@@ -14,17 +14,10 @@ use std::time::Duration;
 use crate::ProviderError;
 use crate::retry::{backoff, redact, request_id, retry_after, retry_delay};
 
-/// What a key check found.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum KeyCheck {
-    /// The models route accepted the key.
-    Accepted,
-    /// The check did not confirm the key: the route answered with
-    /// another status, or the request failed. Many compatible servers
-    /// do not serve the route. The text says what happened.
-    Unconfirmed(String),
-}
+/// One result type for every adapter's key check; many compatible
+/// servers do not serve the models route, so this check can leave a
+/// key [`KeyCheck::Unconfirmed`].
+pub use crate::KeyCheck;
 
 /// Check a key with `GET {base_url}/models`. A 2xx reply accepts it.
 /// A 401 refuses it with an error, and so does a request that does not

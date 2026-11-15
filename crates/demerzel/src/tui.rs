@@ -82,6 +82,9 @@ pub async fn run(config: &RunConfig) -> Result<(), RunError> {
         branch,
     };
     let result = demerzel_tui::run(&mut driver, options).await;
+    // The judgment records in flight land before the run ends; their
+    // late notices go to the shell's own stream.
+    runtime.settle_at_exit().await;
     // The interface gave the screen back; the line lands on the
     // shell's own stream, whatever ended the session.
     if let Some(id) = &driver.opened {
@@ -357,6 +360,9 @@ impl Driver for TuiDriver<'_> {
                 Ok(TurnOutcome::Refused) => events.error("demerzel: the model refused the request"),
                 Ok(_) => {}
                 Err(error) => events.error(format!("demerzel: {error}")),
+            }
+            for notice in self.runtime.take_notices() {
+                events.notice(notice);
             }
         }))
     }

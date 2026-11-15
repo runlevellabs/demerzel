@@ -8,9 +8,14 @@
 //!   harness-added latency is `turn_text - transport_floor`.
 //! - `turn_read_tool`: a turn with one read dispatch, two model calls.
 //! - `turn_text_compat`: `turn_text` through a named `openai-compat`
-//!   instance on the Chat Completions route.
+//!   instance on the Chat Completions route. The run also defines a
+//!   judge instance, with judgments off.
 //! - `turn_text_responses`: `turn_text` through a named
 //!   `openai-responses` instance on the Responses API route.
+//! - `turn_text_judged`: `turn_text_compat` with judgments on: every
+//!   check at `log` and a judge key in the store. A text turn sends no
+//!   judge request, so the case measures the loop seam alone; the bench
+//!   checks after the case that the mock judged and refused nothing.
 //!
 //! The bench drives `demerzel::Runtime`, the same wiring the
 //! interfaces use. Session and engine construction, and session-file
@@ -132,6 +137,51 @@ impl Bed {
     }
 }
 
+/// The judge model of the judged beds.
+const JUDGE_MODEL: &str = "jev-1.14.0";
+
+/// A named compatible head at the mock's `/v1` root, and a judge
+/// instance at the mock's root. With `judged`, every check runs at
+/// `log` and the judge's key is in the run's store.
+fn compat_with_judge(config: &mut RunConfig, judged: bool) {
+    let url = config.instance.base_url.take().expect("the mock URL");
+    config.instance.name = "bench-compat".into();
+    config.instance.kind = "openai-compat".into();
+    config.instance.base_url = Some(format!("{url}/v1"));
+    let user = demerzel::config::Layer::parse(&format!(
+        "[providers.judge]\nkind = \"typesafe\"\nbase_url = \"{url}\"\nmodel = \"{JUDGE_MODEL}\"\n"
+    ))
+    .expect("parse the judge instance")
+    .0;
+    config.other_instances = demerzel::config::run_instances(
+        &demerzel::config::Flags::default(),
+        &|_| None,
+        None,
+        Some(&user),
+    )
+    .into_iter()
+    .filter(|resolved| resolved.instance.name != "bench-compat")
+    .collect();
+    if judged {
+        let store = &config.auth.as_ref().expect("the bench store").store;
+        demerzel_providers::auth::AuthStore::set_instance_key(
+            store,
+            "judge",
+            "fake-bench-judge-key",
+            &url,
+        )
+        .expect("store the judge key");
+        let mut judgments = demerzel::config::Judgments::new("judge");
+        judgments.checks = demerzel::config::Checks::uniform(demerzel::config::CheckAction::Log);
+        config.judgments = Some(judgments);
+    }
+}
+
+/// Settle the bed's judgment requests, outside any timed span.
+fn bed_rt_settle(runtime: &tokio::runtime::Runtime, bed: &Bed) {
+    runtime.block_on(bed.runtime.settle());
+}
+
 fn bench_turns(c: &mut Criterion) {
     let bench_rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -206,15 +256,11 @@ fn bench_turns(c: &mut Criterion) {
     drop(bed);
 
     // `turn_text` through a named compatible instance: the same turn
-    // on the Chat Completions route, with no credential.
+    // on the Chat Completions route, with no credential. The run also
+    // knows a judge instance, so the case differs from
+    // `turn_text_judged` only by judgments.
     let bed = Bed::start_with(vec![compat::text_turn("done")], |config| {
-        config.instance.name = "bench-compat".into();
-        config.instance.kind = "openai-compat".into();
-        config.instance.base_url = config
-            .instance
-            .base_url
-            .take()
-            .map(|url| format!("{url}/v1"));
+        compat_with_judge(config, false);
     });
     c.bench_function("turn_text_compat", |b| {
         b.to_async(&bench_rt).iter_custom(|iters| {
@@ -228,6 +274,43 @@ fn bench_turns(c: &mut Criterion) {
             }
         })
     });
+    drop(bed);
+
+    // `turn_text_compat` with judgments: every check at `log`, and a
+    // judge key in the store, so a check that fired would send a
+    // request. A text turn has no call, so none fires.
+    let bed = Bed::start_with(vec![compat::text_turn("done")], |config| {
+        compat_with_judge(config, true);
+    });
+    bed.mock.set_judge(demerzel_mock::JudgeScript {
+        model: JUDGE_MODEL.into(),
+        answers: [
+            "approval.destructive",
+            "approval.in_scope",
+            "outcome",
+            "progress",
+            "claim",
+        ]
+        .into_iter()
+        .map(|id| (id.to_string(), demerzel_mock::systemone::noul(0.5)))
+        .collect(),
+    });
+    c.bench_function("turn_text_judged", |b| {
+        b.to_async(&bench_rt).iter_custom(|iters| {
+            let bed = &bed;
+            async move {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    total += bed.timed_turn(2).await;
+                }
+                total
+            }
+        })
+    });
+    bed_rt_settle(&bench_rt, &bed);
+    assert_eq!(bed.mock.judged(), 0, "a text turn sends no judge request");
+    assert_eq!(bed.mock.refused(), 0, "the mock refused a request");
+    assert!(bed.runtime.take_notices().is_empty());
     drop(bed);
 
     // `turn_text` through a named Responses instance: the same turn on

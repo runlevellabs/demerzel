@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use crate::retry::{backoff, redact, request_id, retry_after, retry_delay};
 use crate::sse::{EventCounts, PayloadMapper, spawn_event_stream};
 use crate::{
-    BoxFuture, Capabilities, EventStream, Provider, ProviderError, Request, StreamEvent,
+    BoxFuture, Capabilities, EventStream, KeyCheck, Provider, ProviderError, Request, StreamEvent,
     ThinkingMode,
 };
 
@@ -82,14 +82,15 @@ impl Default for AnthropicConfig {
     }
 }
 
-/// Check an API key with one cheap call: list one model. `Ok` means
-/// the endpoint accepted the key. `dmz login anthropic` verifies a
-/// key with this before it stores it.
+/// Check an API key with one cheap call: list one model.
+/// [`KeyCheck::Accepted`] means the endpoint accepted the key; every
+/// other outcome is an error. `dmz login anthropic` verifies a key
+/// with this before it stores it.
 pub async fn verify_key(
     http: &reqwest::Client,
     base_url: &str,
     api_key: &str,
-) -> Result<(), ProviderError> {
+) -> Result<KeyCheck, ProviderError> {
     let url = format!("{base_url}/v1/models?limit=1");
     let response = http
         .get(&url)
@@ -100,7 +101,7 @@ pub async fn verify_key(
         .map_err(|e| ProviderError::Network(format!("key check: {e}")))?;
     let status = response.status();
     if status.is_success() {
-        return Ok(());
+        return Ok(KeyCheck::Accepted);
     }
     // Every 4xx except 429 means the endpoint refused this check —
     // a bad key, or a wrong endpoint URL. Not an outage.

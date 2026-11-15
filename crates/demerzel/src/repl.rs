@@ -528,6 +528,9 @@ async fn repl(runtime: &Runtime) -> Result<(), RunError> {
                     runtime.config().max_model_calls,
                 )
                 .await;
+                for notice in runtime.take_notices() {
+                    eprintln!("demerzel: {notice}");
+                }
             }
             ReadOutcome::Interrupted => {
                 if quit_asked.is_some_and(|until| Instant::now() < until) {
@@ -539,6 +542,14 @@ async fn repl(runtime: &Runtime) -> Result<(), RunError> {
             ReadOutcome::Closed => break,
         }
     }
+    // The judgment records in flight land before the run ends. A
+    // Ctrl-C from before the wait does not end it; one during it does.
+    drain(&mut sigint).await;
+    runtime
+        .settle_at_exit_or(async {
+            sigint.recv().await;
+        })
+        .await;
     // The line lands after the last prompt, whatever ended the
     // session; a run that opened no session prints nothing.
     if let Some(id) = &opened {

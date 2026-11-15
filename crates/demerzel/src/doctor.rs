@@ -8,7 +8,7 @@ use std::time::SystemTime;
 
 use demerzel_core::{ApprovalMode, SessionStore};
 use demerzel_providers::auth::{AuthStore, CredentialSource, NO_CREDENTIALS_HELP};
-use demerzel_providers::{AdapterRules, EffortWire, anthropic, openai_codex};
+use demerzel_providers::{AdapterRules, EffortWire, anthropic, openai_codex, typesafe};
 
 use crate::config::{self, Flags, Layer, Locations, Origin};
 use crate::prompt;
@@ -40,7 +40,11 @@ pub fn report(project_dir: &Path, flags: &Flags, out: &mut dyn Write) -> std::io
         user.as_ref(),
     );
     writeln!(out, "active settings")?;
-    for warning in &ignored {
+    // The judgments section prints its own ignored keys.
+    for warning in ignored
+        .iter()
+        .filter(|warning| !settings.judgments.ignored.contains(warning))
+    {
         writeln!(out, "  warning: {warning}")?;
     }
     print_setting(
@@ -177,11 +181,13 @@ pub fn report(project_dir: &Path, flags: &Flags, out: &mut dyn Write) -> std::io
         problems += 1;
         writeln!(out, "  problem: {problem}")?;
     }
+    // Every configured instance, as a session resolves it: the roles
+    // and the judge name only these.
+    let env = |name: &str| std::env::var(name).ok();
+    let instances = config::run_instances(flags, &env, project.as_ref(), user.as_ref());
     // Each role's chain, with the model each target resolves to. A
     // target on an instance that config does not define stops a run.
     if !settings.roles.is_empty() {
-        let env = |name: &str| std::env::var(name).ok();
-        let instances = config::run_instances(flags, &env, project.as_ref(), user.as_ref());
         let (chains, role_problems) = config::chains(&settings, &instances);
         for (role, targets) in &chains {
             let chain: Vec<String> = targets
@@ -211,7 +217,20 @@ pub fn report(project_dir: &Path, flags: &Flags, out: &mut dyn Write) -> std::io
         store_path.as_deref(),
         out,
     )?;
-    report_credentials(&settings, store_path.as_deref(), &mut problems, out)?;
+    report_judgments(
+        &settings,
+        &instances,
+        store_path.as_deref(),
+        &mut problems,
+        out,
+    )?;
+    report_credentials(
+        &settings,
+        &instances,
+        store_path.as_deref(),
+        &mut problems,
+        out,
+    )?;
     // A read-only session never writes the project root, so a
     // non-writable root is only a note there.
     let read_only = settings.approval.value == Some(ApprovalMode::ReadOnly);
@@ -446,10 +465,16 @@ fn report_instances(
 ) -> std::io::Result<()> {
     writeln!(out, "provider instances")?;
     if instances.is_empty() {
+        // The model adapters; the judgments section names the judge.
+        let adapters: Vec<&str> = demerzel_providers::PROVIDER_IDS
+            .iter()
+            .copied()
+            .filter(|id| demerzel_providers::adapter_rules(id).is_some_and(|r| r.serves_model))
+            .collect();
         writeln!(
             out,
             "  none in the user file; the adapters {} stand for themselves",
-            demerzel_providers::PROVIDER_IDS.join(", ")
+            adapters.join(", ")
         )?;
         return Ok(());
     }
@@ -457,18 +482,26 @@ fn report_instances(
         let Some(rules) = demerzel_providers::adapter_rules(&instance.kind) else {
             continue;
         };
-        let endpoint = match (&instance.base_url, rules.needs_endpoint) {
-            (Some(url), _) => url.as_str(),
-            (None, true) => "none — set base_url",
-            (None, false) => "the adapter's default",
+        let default_url = demerzel_providers::default_base_url(&instance.kind);
+        let endpoint = match (&instance.base_url, rules.needs_endpoint, default_url) {
+            (Some(url), _, _) => url.clone(),
+            (None, true, _) => "none — set base_url".to_string(),
+            (None, false, Some(url)) => format!("{url} (the adapter's default)"),
+            (None, false, None) => "the adapter's default".to_string(),
         };
-        let has_default = demerzel_providers::default_model(&instance.kind).is_some();
-        let model = match (&instance.model, has_default) {
-            (Some(model), _) => model.as_str(),
-            (None, false) => "none — set model",
-            (None, true) => "the adapter's default",
+        let model = match (
+            &instance.model,
+            demerzel_providers::default_model(&instance.kind),
+        ) {
+            (Some(model), _) => model.clone(),
+            (None, None) => "none — set model".to_string(),
+            (None, Some(model)) => format!("{model} (the adapter's default)"),
         };
-        let stored = stored_key(store_path, &instance.name, instance.base_url.as_deref());
+        let stored = stored_key(
+            store_path,
+            &instance.name,
+            instance.base_url.as_deref().or(default_url),
+        );
         let thinking = match instance.thinking_mode {
             Some(mode) => format!(", thinking {mode}"),
             None => String::new(),
@@ -485,11 +518,128 @@ fn report_instances(
                 stored
             )
         )?;
-        for problem in config::instance_problems(instance) {
+        // A judge kind runs only as a judge: check it as one.
+        let instance_problems = if rules.serves_model {
+            config::instance_problems(instance)
+        } else {
+            config::judge_problems(instance)
+        };
+        for problem in instance_problems {
             writeln!(out, "  warning: {problem}")?;
         }
     }
     Ok(())
+}
+
+/// Report the judgments: the judge instance with its kind, endpoint,
+/// model, and key, each check's action, the call cap, the project keys
+/// the trust rule ignored, and each problem that stops a run. An alias
+/// model id gets a note: its answers can change without a config
+/// change. Without `judgments.instance`, one line says judgments are
+/// off.
+fn report_judgments(
+    settings: &config::Settings,
+    instances: &[config::Resolved],
+    store_path: Option<&Path>,
+    problems: &mut u32,
+    out: &mut dyn Write,
+) -> std::io::Result<()> {
+    writeln!(out, "judgments")?;
+    let own = &settings.judgments;
+    for warning in &own.ignored {
+        writeln!(out, "  warning: {warning}")?;
+    }
+    if let Err(error) = config::judgments(settings, instances) {
+        for problem in error.lines() {
+            *problems += 1;
+            writeln!(out, "  problem: {problem}")?;
+        }
+    }
+    let Some(name) = own.instance.value.as_deref() else {
+        writeln!(
+            out,
+            "  off — the user file sets no judgments.instance, so no check runs"
+        )?;
+        return Ok(());
+    };
+    print_setting(out, "instance", name, own.instance.origin)?;
+    let judge = instances
+        .iter()
+        .find(|resolved| resolved.instance.name == name);
+    if let Some(resolved) = judge
+        && let instance = &resolved.instance
+        && let Some(rules) = demerzel_providers::adapter_rules(&instance.kind)
+        && rules.serves_judge
+    {
+        let default_url = demerzel_providers::default_base_url(&instance.kind);
+        let base_url = instance.base_url.as_deref().or(default_url);
+        let endpoint = match (&instance.base_url, base_url) {
+            (Some(url), _) => url.clone(),
+            (None, Some(url)) => format!("{url} (the adapter's default)"),
+            (None, None) => "none".to_string(),
+        };
+        let model = instance.model.as_deref().unwrap_or("none");
+        let variable = instance.api_key_env.as_deref();
+        let stored = match variable {
+            Some(_) => Stored::None,
+            None => stored_key(store_path, name, base_url),
+        };
+        writeln!(
+            out,
+            "  judge: {} — endpoint {endpoint}, model {model}, key {}",
+            instance.kind,
+            key_state(name, variable, rules, stored)
+        )?;
+        if instance.kind == typesafe::PROVIDER_ID && typesafe::is_alias(model) {
+            writeln!(
+                out,
+                "  note: the model `{model}` is an alias. The alias can move to a new version, \
+                 and its answers can change. A pinned version id, such as jev-1.14.0, stays fixed."
+            )?;
+        }
+        // Without a key the judge does not build: the session runs,
+        // and its checks send no request.
+        let keyless = match variable {
+            Some(variable) => !env_set(variable),
+            None => stored != Stored::Serves,
+        };
+        if keyless {
+            writeln!(
+                out,
+                "  warning: judge `{name}` has no usable key, so its checks send no request"
+            )?;
+        }
+        // Keys a model instance takes and a judge does not.
+        let mut unused = Vec::new();
+        // A flag or a variable names the session's effort, not this
+        // instance's.
+        if matches!(resolved.effort_origin, Origin::User | Origin::Project) {
+            unused.push("effort");
+        }
+        if instance.context_window.is_some() {
+            unused.push("context_window");
+        }
+        for key in unused {
+            writeln!(
+                out,
+                "  warning: ignored: providers.{name}.{key}; a judge does not use it"
+            )?;
+        }
+    }
+    for (check, action) in &own.checks {
+        print_setting(
+            out,
+            &format!("checks.{check}"),
+            action.value.as_str(),
+            action.origin,
+        )?;
+    }
+    print_setting(
+        out,
+        "max_calls",
+        &own.max_calls.value.to_string(),
+        own.max_calls.origin,
+    )
 }
 
 /// What the store holds for one instance, read the way a session
@@ -532,6 +682,10 @@ fn key_state(name: &str, api_key_env: Option<&str>, rules: AdapterRules, stored:
                 "in the dmz store for another endpoint — run `dmz login {name}` for this one"
             ),
             Stored::Unreadable => "unknown — the auth store does not read".to_string(),
+            // A judge sends no request without a key.
+            Stored::None if !rules.serves_model => {
+                format!("none — run `dmz login {name}`, or set api_key_env")
+            }
             Stored::None => "none — requests carry no Authorization header".to_string(),
         },
     }
@@ -546,6 +700,7 @@ fn env_set(variable: &str) -> bool {
 /// is information, not a blocker.
 fn report_credentials(
     settings: &config::Settings,
+    instances: &[config::Resolved],
     store_path: Option<&Path>,
     problems: &mut u32,
     out: &mut dyn Write,
@@ -579,6 +734,32 @@ fn report_credentials(
             out,
             "  {prefix}{name}: key {}",
             key_state(name, variable, rules, stored)
+        )?;
+    }
+    // The judge's key, when judgments name one: a missing key stops
+    // no session, so it is information.
+    if let Some(judge) = settings.judgments.instance.value.as_deref()
+        && judge != name.as_str()
+        && let Some(instance) = instances
+            .iter()
+            .map(|resolved| &resolved.instance)
+            .find(|instance| instance.name == judge)
+        && let Some(judge_rules) = demerzel_providers::adapter_rules(&instance.kind)
+        && judge_rules.serves_judge
+    {
+        let variable = instance.api_key_env.as_deref();
+        let base_url = instance
+            .base_url
+            .as_deref()
+            .or(demerzel_providers::default_base_url(&instance.kind));
+        let stored = match variable {
+            Some(_) => Stored::None,
+            None => stored_key(store_path, judge, base_url),
+        };
+        writeln!(
+            out,
+            "  {judge} (judge): key {}",
+            key_state(judge, variable, judge_rules, stored)
         )?;
     }
     let active_provider = if own_line { "" } else { kind };

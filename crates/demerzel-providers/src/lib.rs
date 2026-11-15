@@ -3,7 +3,9 @@
 //! The provider contract — the trait, capabilities, request shape, and
 //! stream events — lives in `demerzel-core` next to the loop that
 //! consumes it. This crate holds the adapters and re-exports the
-//! contract, so adapter code and adapter users import one crate.
+//! contract, so adapter code and adapter users import one crate. It
+//! also holds the judge backends, which implement the core `Judge`
+//! contract.
 
 pub mod anthropic;
 pub mod auth;
@@ -14,6 +16,7 @@ pub mod openai_compat;
 pub mod openai_responses;
 mod retry;
 mod sse;
+pub mod typesafe;
 
 pub use demerzel_core::{
     BoxFuture, Capabilities, Effort, EventStream, Provider, ProviderError, Request, StreamEvent,
@@ -21,14 +24,52 @@ pub use demerzel_core::{
 };
 
 /// The adapter ids this build ships: the values of a provider
-/// instance's `kind`. A slice, so a new adapter never changes the
-/// item's type.
+/// instance's `kind`, model adapters and judge backends alike. A
+/// slice, so a new adapter never changes the item's type.
+/// [`AdapterRules`] says what each one serves.
 pub const PROVIDER_IDS: &[&str] = &[
     openai_codex::PROVIDER_ID,
     anthropic::PROVIDER_ID,
     openai_compat::PROVIDER_ID,
     openai_responses::PROVIDER_ID,
+    typesafe::PROVIDER_ID,
 ];
+
+/// What a key check found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum KeyCheck {
+    /// The endpoint accepted the key.
+    Accepted,
+    /// The check did not confirm the key: the route answered with
+    /// another status, or the request failed. Only an adapter whose
+    /// servers may lack the route returns it. The text says what
+    /// happened.
+    Unconfirmed(String),
+}
+
+/// Check an instance key at the route its adapter owns:
+/// `{base_url}/models` for `openai-compat` and `openai-responses`,
+/// `{base_url}/v1/models` for `typesafe`. Any other kind takes no
+/// stored instance key, and the check fails without a request.
+/// `instance` names the instance in the text.
+pub async fn verify_instance_key(
+    kind: &str,
+    http: &reqwest::Client,
+    instance: &str,
+    base_url: &str,
+    key: &str,
+) -> Result<KeyCheck, ProviderError> {
+    match kind {
+        openai_compat::PROVIDER_ID | openai_responses::PROVIDER_ID => {
+            endpoint::verify_key(http, instance, base_url, key).await
+        }
+        typesafe::PROVIDER_ID => typesafe::verify_key(http, instance, base_url, key).await,
+        _ => Err(ProviderError::InvalidRequest(format!(
+            "instance `{instance}` ({kind}) takes no stored key, so it has no key check"
+        ))),
+    }
+}
 
 /// How an instance sets the thinking and effort fields: the value of
 /// the `thinking` config key, for an adapter with a thinking switch
@@ -102,6 +143,11 @@ pub struct AdapterRules {
     /// An instance can set `thinking`: the adapter can turn its
     /// thinking and effort fields off.
     pub thinking_switch: bool,
+    /// An instance can be a model target: the run's head, a role, a
+    /// fallback target, or a `/model` switch.
+    pub serves_model: bool,
+    /// An instance can serve as the judge of the loop's checks.
+    pub serves_judge: bool,
 }
 
 /// The rules of adapter `kind`; `None` for an id this build lacks.
@@ -113,6 +159,8 @@ pub fn adapter_rules(kind: &str) -> Option<AdapterRules> {
             key_variable: false,
             own_credentials: true,
             thinking_switch: false,
+            serves_model: true,
+            serves_judge: false,
         },
         anthropic::PROVIDER_ID => AdapterRules {
             needs_endpoint: false,
@@ -120,6 +168,8 @@ pub fn adapter_rules(kind: &str) -> Option<AdapterRules> {
             key_variable: true,
             own_credentials: true,
             thinking_switch: true,
+            serves_model: true,
+            serves_judge: false,
         },
         openai_compat::PROVIDER_ID | openai_responses::PROVIDER_ID => AdapterRules {
             needs_endpoint: true,
@@ -127,6 +177,17 @@ pub fn adapter_rules(kind: &str) -> Option<AdapterRules> {
             key_variable: true,
             own_credentials: false,
             thinking_switch: false,
+            serves_model: true,
+            serves_judge: false,
+        },
+        typesafe::PROVIDER_ID => AdapterRules {
+            needs_endpoint: false,
+            implicit_effort: false,
+            key_variable: true,
+            own_credentials: false,
+            thinking_switch: false,
+            serves_model: false,
+            serves_judge: true,
         },
         _ => return None,
     };
@@ -189,6 +250,19 @@ pub fn default_model(provider_id: &str) -> Option<&'static str> {
     match provider_id {
         openai_codex::PROVIDER_ID => Some(openai_codex::DEFAULT_MODEL),
         anthropic::PROVIDER_ID => Some(anthropic::DEFAULT_MODEL),
+        typesafe::PROVIDER_ID => Some(typesafe::DEFAULT_MODEL),
+        _ => None,
+    }
+}
+
+/// The default `base_url` of a kind whose instance takes a stored key
+/// without naming an endpoint: `typesafe`. `None` for every other
+/// kind: an endpoint adapter's instance names its `base_url`, and a
+/// model adapter with credentials of its own keeps its endpoint in
+/// its own config.
+pub fn default_base_url(kind: &str) -> Option<&'static str> {
+    match kind {
+        typesafe::PROVIDER_ID => Some(typesafe::DEFAULT_BASE_URL),
         _ => None,
     }
 }
@@ -214,7 +288,9 @@ mod tests {
     #[test]
     fn the_catalogs_name_the_default_models_and_nothing_unknown() {
         for id in PROVIDER_IDS {
-            if let Some(model) = default_model(id) {
+            // A judge has no context window to report.
+            let serves_model = adapter_rules(id).unwrap().serves_model;
+            if let Some(model) = default_model(id).filter(|_| serves_model) {
                 assert!(context_window(id, model).is_some(), "{id}");
             }
             assert_eq!(context_window(id, "not-a-model"), None, "{id}");
@@ -262,8 +338,33 @@ mod tests {
                 assert_eq!(default_model(id), None, "{id}");
                 assert!(!rules.own_credentials, "{id}");
             }
+            // Every kind serves something, and a default endpoint
+            // never stands beside a required one.
+            assert!(rules.serves_model || rules.serves_judge, "{id}");
+            if default_base_url(id).is_some() {
+                assert!(!rules.needs_endpoint, "{id}");
+            }
         }
         assert_eq!(adapter_rules("not-an-adapter"), None);
         assert_eq!(context_window("not-a-provider", "gpt-5.6-sol"), None);
+        assert_eq!(default_base_url("not-an-adapter"), None);
+    }
+
+    #[test]
+    fn the_judge_kind_serves_only_as_a_judge() {
+        let rules = adapter_rules(typesafe::PROVIDER_ID).unwrap();
+        assert!(rules.serves_judge && !rules.serves_model);
+        // A judge needs no endpoint and no model in config, takes its
+        // key from a variable or the store, and has no switch.
+        assert!(!rules.needs_endpoint && rules.key_variable);
+        assert!(!rules.own_credentials && !rules.thinking_switch);
+        assert_eq!(
+            default_base_url(typesafe::PROVIDER_ID),
+            Some(typesafe::DEFAULT_BASE_URL)
+        );
+        assert_eq!(
+            default_model(typesafe::PROVIDER_ID),
+            Some(typesafe::DEFAULT_MODEL)
+        );
     }
 }

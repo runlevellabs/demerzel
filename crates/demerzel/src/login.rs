@@ -6,10 +6,13 @@
 //! prompts for an API key with echo off, verifies it with one cheap
 //! call, and stores it. `dmz login <instance>` does the same for an
 //! instance of an adapter without credentials of its own, such as
-//! `openai-compat`; only a 401 refuses that key, because many
-//! compatible servers do not serve the check route. The wire contract
-//! lives in `demerzel_providers::oauth` and
-//! `demerzel_providers::endpoint`; this module owns the interaction.
+//! `openai-compat` or the `typesafe` judge kind. The adapter owns the
+//! check route and decides which answers refuse the key: for a
+//! compatible server only a 401 refuses it, because many of them do
+//! not serve the route; the `typesafe` service serves it, so only a
+//! 2xx accepts the key. The wire contract lives in
+//! `demerzel_providers::oauth` and the adapters; this module owns the
+//! interaction.
 //!
 //! The loopback listener hand-rolls its HTTP reply, so the flow needs
 //! no HTTP-server dependency. Each connection is served on its own
@@ -27,8 +30,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use demerzel_providers::auth::{self, AuthStore};
-use demerzel_providers::endpoint::{self, KeyCheck};
-use demerzel_providers::{ProviderError, anthropic, oauth, openai_codex};
+use demerzel_providers::{
+    KeyCheck, ProviderError, anthropic, oauth, openai_codex, openai_compat, openai_responses,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -77,10 +81,13 @@ pub enum Method {
     /// The anthropic adapter's API key, checked at `base_url`.
     Anthropic { base_url: String },
     /// The key of one instance of an adapter without credentials of
-    /// its own, checked at the instance's endpoint. `origin` names the
-    /// layer that set the endpoint, for the prompt.
+    /// its own, checked at the instance's endpoint through the route
+    /// that `kind` owns. `origin` names the layer that set the
+    /// endpoint, for the prompt; `Default` means the kind's default
+    /// endpoint.
     Instance {
         name: String,
+        kind: String,
         base_url: String,
         origin: Origin,
     },
@@ -92,7 +99,8 @@ pub enum Method {
 /// instance of that adapter shares it. An instance of an adapter
 /// without credentials of its own takes a stored key, unless its
 /// `api_key_env` names the key: that variable wins over the store, so
-/// a stored key would never serve it.
+/// a stored key would never serve it. Without a configured endpoint,
+/// the check goes to the kind's default endpoint, when it has one.
 pub fn method(settings: &Settings) -> Result<Method, RunError> {
     let name = settings.provider.value.as_str();
     let Some(kind) = settings.kind.value.as_deref() else {
@@ -138,17 +146,25 @@ pub fn method(settings: &Settings) -> Result<Method, RunError> {
              `api_key_env` from `[providers.{name}]` to use a stored key"
         )));
     }
-    let Some(base_url) = settings.base_url.value.clone() else {
-        return Err(RunError::Config(format!(
-            "provider `{name}` ({kind}) needs `base_url` for the key check: set it in \
-             `[providers.{name}]` of the user file, with --base-url, or with {}",
-            crate::config::ENV_BASE_URL
-        )));
+    let (base_url, origin) = match (
+        settings.base_url.value.clone(),
+        demerzel_providers::default_base_url(kind),
+    ) {
+        (Some(base_url), _) => (base_url, settings.base_url.origin),
+        (None, Some(default)) => (default.to_string(), Origin::Default),
+        (None, None) => {
+            return Err(RunError::Config(format!(
+                "provider `{name}` ({kind}) needs `base_url` for the key check: set it in \
+                 `[providers.{name}]` of the user file, with --base-url, or with {}",
+                crate::config::ENV_BASE_URL
+            )));
+        }
     };
     Ok(Method::Instance {
         name: name.to_string(),
+        kind: kind.to_string(),
         base_url,
-        origin: settings.base_url.origin,
+        origin,
     })
 }
 
@@ -159,9 +175,10 @@ pub async fn run(method: &Method, options: &Options) -> Result<(), RunError> {
         Method::Anthropic { base_url } => anthropic_login(options, base_url).await,
         Method::Instance {
             name,
+            kind,
             base_url,
             origin,
-        } => instance_login(options, name, base_url, *origin).await,
+        } => instance_login(options, name, kind, base_url, *origin).await,
     }
 }
 
@@ -312,35 +329,46 @@ async fn anthropic_login(options: &Options, base_url: &str) -> Result<(), RunErr
 async fn instance_login(
     options: &Options,
     name: &str,
+    kind: &str,
     base_url: &str,
     origin: Origin,
 ) -> Result<(), RunError> {
     // The endpoint gets the key, now and in every session; name it and
     // the layer that chose it before the user types.
-    println!(
-        "The key for `{name}` goes to {} (base_url from the {origin}).",
-        base_url.trim_end_matches('/')
-    );
+    let endpoint = base_url.trim_end_matches('/');
+    match origin {
+        Origin::Default => println!(
+            "The key for `{name}` goes to {endpoint}, the default endpoint of the {kind} kind."
+        ),
+        origin => println!("The key for `{name}` goes to {endpoint} (base_url from the {origin})."),
+    }
     let key = prompt_for_key(&format!("API key for `{name}`: ")).await?;
-    let check = store_instance_key(options, name, base_url, key).await?;
+    let check = store_instance_key(options, name, kind, base_url, key).await?;
     if let KeyCheck::Unconfirmed(reason) = check {
+        let why = match kind {
+            openai_compat::PROVIDER_ID | openai_responses::PROVIDER_ID => {
+                ", because many compatible servers do not serve that route"
+            }
+            _ => "",
+        };
         eprintln!(
             "demerzel: warning: the key check did not confirm the key: {reason}. The key is \
-             stored anyway, because many compatible servers do not serve that route."
+             stored anyway{why}."
         );
     }
     println!("Login complete. The key for `{name}` is in the dmz auth store.");
     Ok(())
 }
 
-/// Check `key` at `GET {base_url}/models` and store it for instance
-/// `name`, bound to that endpoint. A 401, or a check that does not
-/// build, refuses the key and stores nothing. Any other failed check
-/// stores the key and returns [`KeyCheck::Unconfirmed`], so the caller
-/// can warn.
+/// Check `key` at the route that adapter `kind` owns under
+/// `base_url`, and store it for instance `name`, bound to that
+/// endpoint. A refused check stores nothing. A check that the adapter
+/// cannot confirm stores the key and returns [`KeyCheck::Unconfirmed`],
+/// so the caller can warn.
 async fn store_instance_key(
     options: &Options,
     name: &str,
+    kind: &str,
     base_url: &str,
     key: String,
 ) -> Result<KeyCheck, RunError> {
@@ -349,13 +377,13 @@ async fn store_instance_key(
             "the key is empty".to_string(),
         )));
     }
-    let check = endpoint::verify_key(&http_client(), name, base_url, &key)
+    let check = demerzel_providers::verify_instance_key(kind, &http_client(), name, base_url, &key)
         .await
         .map_err(|error| match error {
             ProviderError::Auth(message) => RunError::Auth(ProviderError::Auth(format!(
                 "{message}; the key is not stored"
             ))),
-            other => RunError::Auth(other),
+            other => RunError::Config(format!("{other}; the key is not stored")),
         })?;
     AuthStore::set_instance_key(&options.store_path, name, &key, base_url)
         .map_err(RunError::Auth)?;
@@ -621,6 +649,7 @@ mod tests {
             method_for("local", USER, None).unwrap(),
             Method::Instance {
                 name: "local".into(),
+                kind: "openai-compat".into(),
                 base_url: "http://127.0.0.1:11434/v1".into(),
                 origin: Origin::User,
             }
@@ -629,6 +658,7 @@ mod tests {
             method_for("api", USER, None).unwrap(),
             Method::Instance {
                 name: "api".into(),
+                kind: "openai-responses".into(),
                 base_url: "https://api.example.test/v1".into(),
                 origin: Origin::User,
             }
@@ -639,6 +669,7 @@ mod tests {
             method_for("bare", USER, Some("http://127.0.0.1:9/v1")).unwrap(),
             Method::Instance {
                 name: "bare".into(),
+                kind: "openai-compat".into(),
                 base_url: "http://127.0.0.1:9/v1".into(),
                 origin: Origin::Flag,
             }

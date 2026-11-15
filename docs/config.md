@@ -51,6 +51,20 @@ base_url = "https://api.example.com/v1"
 model = "vendor-model"
 api_key_env = "API_KEY"
 
+[providers.judge]                # a judge instance, see Judgments
+kind = "typesafe"
+model = "jev-1.14.0"             # a pinned version id
+
+[judgments]                      # see Judgments and Trust rules
+instance = "judge"               # user file only; unset: no check runs
+max_calls = 500                  # judge requests one session may send
+
+[judgments.checks]
+outcome = "log"                  # off | log
+progress = "log"
+claim = "log"
+approval = "log"
+
 [roles.default]                  # the head target and its fallbacks, see Roles
 chain = [
   { provider = "anthropic", model = "claude-sonnet-5" },
@@ -84,6 +98,9 @@ error = "bright-red"
 | `providers.<name>.api_key_env` | — | — | unset: the adapter's own credentials |
 | `providers.<name>.thinking` | — | — | `adaptive` |
 | `roles.<name>.chain` | — | — | unset: `provider` and `model` name the head |
+| `judgments.instance` | — | — | unset: no check runs |
+| `judgments.checks.<name>` | — | — | `log` |
+| `judgments.max_calls` | — | — | `500` |
 | `history_file` | — | — | `true` |
 | `prompt.base_file` | — | — | unset: the built-in base prompt |
 | `tui.mouse` | — | — | `true` |
@@ -104,8 +121,9 @@ A top-level `effort` applies to any provider.
 
 A `[providers.<name>]` table with `kind` defines a provider instance.
 `kind` names the adapter: `openai-codex`, `anthropic`,
-`openai-compat`, or `openai-responses`. `provider` then selects the
-instance by its name. One adapter can serve many instances.
+`openai-compat`, `openai-responses`, or the judge kind `typesafe`.
+`provider` then selects the instance by its name. One adapter can
+serve many instances.
 
 A table without `kind` keeps its earlier meaning: the name is the
 adapter id, and the table tunes that adapter. Each adapter id also
@@ -189,6 +207,67 @@ The session file names the instance in `meta.provider` and its adapter
 in `meta.kind`. `doctor` lists each instance with its adapter, its
 endpoint, its model, and the source of its key.
 
+### The judge kind
+
+The `typesafe` kind serves only as a judge; see "Judgments". Its
+instance takes three keys:
+
+- `base_url`: the API root. The default is `https://api.typesafe.ai`.
+  The judge sends requests to `{base_url}/v1/systemone`.
+- `model`: the judge model. The default is `jev-latest`.
+- `api_key_env`: the variable that holds the key.
+
+Other instance keys:
+
+- `thinking` stops the run at boot. The kind has no thinking switch.
+- The run ignores `effort` and `context_window`. `doctor` shows a
+  warning for each one.
+
+`typesafe` is an adapter id, like the model adapters. Thus a
+`[providers.typesafe]` table cannot set another `kind`. A table of that
+name with another `kind` stops the run at boot. Give such an instance
+another name. The list of providers in a provider error names only the
+model adapters, not the judge kind.
+
+`jev-latest` is an alias. The service can move an alias to a new
+version, and the answers of the judge can then change. `doctor`
+prints a note for an alias. Pin a version id, such as `jev-1.14.0`,
+to keep the model fixed.
+
+A judge instance finds its key in this order:
+
+1. The environment variable that `api_key_env` names. When the
+   variable is unset or empty, the judge does not build.
+2. The key that `dmz login <name>` stored for the instance. The key
+   goes only to the endpoint that the login checked it at.
+
+Without a key, the judge does not build. The session runs without
+checks; see "Judgments".
+
+`dmz login <name>` takes a `typesafe` instance, also the implicit
+`typesafe` instance. It checks the key with
+`GET {base_url}/v1/models`. Only a 2xx reply stores the key. Any other
+reply or failure refuses the key, and the message says that the key is
+not stored. The login refuses an instance with `api_key_env`. With
+`--base-url` or `DEMERZEL_BASE_URL` set, the login prints one line: the
+override does not apply to a judge instance, and the line names the
+endpoint that gets the key.
+
+A judge instance is not a model target. The run stops at boot when
+one of these names a judge instance:
+
+- `provider`, `--provider`, or `DEMERZEL_PROVIDER`;
+- a role target, in the user file or in the project file.
+
+`/model` gives an error for a judge instance, and the session stays as
+it was. A top-level `model` never becomes the model of a judge
+instance. `--base-url` and `DEMERZEL_BASE_URL` never apply to a judge
+instance.
+
+`doctor` lists a judge instance under the provider instances, with
+its model or the adapter's default model. Its credentials section
+shows the state of the judge's key.
+
 ## Roles
 
 A `[roles.<name>]` table names a chain of targets. Each target is a
@@ -241,6 +320,210 @@ project role that names another instance, with a warning, and the
 user file's role of the same name applies. `doctor` shows each role's
 chain. The roles other than `default` serve subagents in a later
 release.
+
+## Judgments
+
+A judge is a second model beside the loop. At some events of a turn,
+Demerzel sends the judge a short state of the turn and yes-or-no
+questions about it. The judge answers each question with the
+probability of yes.
+
+In this build, the checks only record. A check changes no decision,
+no tool result, and no request to the main model. The `warn`, `note`,
+and `act` actions and the judgment rules arrive in a later step.
+
+### The keys
+
+- `judgments.instance`: the judge instance. It names an instance of
+  the `typesafe` kind: the implicit `typesafe` instance or a
+  `[providers.<name>]` table; see "The judge kind". Without it, no
+  check runs. Only the user file can set it. No flag and no variable
+  turns judgments on.
+- `judgments.checks.<name>`: the action of one check. The values are
+  `off` and `log`. The default is `log`. A check at `off` sends no
+  question.
+- `judgments.max_calls`: the most judge requests that one session can
+  send. The value is a positive integer. The default is `500`.
+
+`judgments.rules` is not in this build. In the user file, it stops the
+run at boot. In a project file, the run ignores it with a warning.
+Another key under `[judgments]` warns as an unknown key. An unknown
+check name warns too.
+
+### The checks
+
+Each check asks at one event of the turn. The `event` field of the
+record names the event.
+
+| Check | Event | Question ids | The check asks when |
+|---|---|---|---|
+| `approval` | `tool_before` | `approval.destructive`, `approval.in_scope` | The approval policy asks the user about a write or execute call in `ask` mode, or allows the call in `auto` mode. |
+| `outcome` | `tool_after` | `outcome` | An execute call, such as `bash`, returns without its error flag. |
+| `progress` | `tool_after` | `progress` | An earlier call of the same tool in the turn ran and failed. A call that the policy refused or the user declined does not count. |
+| `claim` | `turn_end` | `claim` | The turn completes, and it holds at least one tool call. |
+
+In `read-only` mode, the policy refuses each write and execute call,
+so the `approval` check does not ask.
+
+One event sends one request with the questions of all its checks. An
+event without a check that asks sends no request.
+
+`log` means this: the judge answers, and the session file keeps the
+answers in a `judgment` record. Nothing else changes.
+
+### Limits
+
+- The call cap: `judgments.max_calls` counts the requests of one
+  session that went out. Each session that a run opens starts a new
+  count, also after `/new`. At the cap, the checks of the session send
+  no more requests. The session shows one notice at the first check
+  that the cap stops. Thus a session that sends exactly `max_calls`
+  requests shows no notice.
+- The requests in flight: one run sends at most 8 judge requests at
+  the same time, over all its sessions. A check waits for a free
+  place, at most the request timeout from its event. A check that
+  gets no place sends nothing. Its record has the error `busy` and a
+  `duration_ms` of 0. It does not count against `max_calls`. A session
+  at its cap writes no `busy` record. Thus a long turn with a stalled
+  judge can write one `busy` record for each event.
+- The timeout: each request has 2 seconds, retries included. The
+  judge retries status 429, status 529 and the other 5xx statuses, and
+  network failures. It follows `retry-after` inside the 2 seconds.
+  Every other status fails at once.
+- A judge that does not build, for example without a key, sends no
+  request and writes no record. The run tries the build again once in
+  each turn. The session shows one notice, and its turns continue. A
+  failed build takes nothing from the cap.
+- A judge that Demerzel cannot reach, for example one that refuses the
+  connection, retries inside the timeout. A one-shot run with a tool
+  call then waits at its exit for that request. The wait at the exit
+  has a bound; see "The record".
+
+A turn never waits for the judge. Each request runs beside the turn,
+and its record lands when the request ends.
+
+### What the judge receives
+
+The judge receives one state for each request. The state is text in
+labeled sections:
+
+- the prompt of the turn, at most 4 KiB;
+- the tool name and the tool input, at most 4 KiB of input;
+- the tail of the tool output, at most 8 KiB;
+- the last 10 calls of the turn, each with its name and `ok` or
+  `error`;
+- for `progress`, the input of the earlier failed call, at most 4 KiB;
+- for `claim`, the final message, at most 4 KiB, and the output tail
+  of the turn's last call.
+
+The whole state is at most 16 KiB. Over that size, Demerzel cuts the
+output tail first. A marker shows each cut: `[cut: N bytes]`. For a
+large tool input, Demerzel stops the input text early, so the marker
+reads `[cut: at least N bytes]`. The state never holds the system
+prompt, the tool definitions, or earlier turns.
+
+A judge receives tool input and tool output, as the main model does.
+That text goes to the endpoint of the judge instance. Choose a judge
+instance that you trust with the content of your project.
+
+### The record
+
+Each request writes one `judgment` record in the session file. A
+check that gets no place in flight writes one too, with the error
+`busy`. The schema of the session file stays 1. A reader without this
+record type skips it. Replay also skips a `judgment` record that this
+build cannot read, so the session still replays and resumes.
+
+| Field | Content |
+|---|---|
+| `event` | `tool_before`, `tool_after`, or `turn_end` |
+| `call_id` | the id of the tool call; absent at `turn_end` |
+| `tool` | the tool name; absent at `turn_end` |
+| `checks` | each check that asked, with the action that config sets for it: `log` |
+| `instance` | the judge instance |
+| `model` | the model id in the reply; absent after a failure |
+| `answers` | each answer by question id; see the answer shapes below; absent after a failure |
+| `state_bytes` | the size of the state, in bytes |
+| `state_sha256` | the SHA-256 of the state, in lowercase hex |
+| `at` | the time the request went out, in RFC 3339 with milliseconds; for `busy`, the time the wait ended |
+| `duration_ms` | the round trip of the request, in milliseconds; 0 for `busy` |
+| `usage` | `input_tokens` and `output_tokens` of the reply; absent after a failure |
+| `error` | `timeout` when the request went out and got no answer in time; `busy` when the check got no place in flight; else the error text, cut at 1 KiB; absent after an answer |
+
+The record keeps the size and the hash of the state, not the state.
+Records land in the order that their requests end.
+
+The record stores each answer in one of three shapes, by its `type`:
+
+- `yes_no`: `yes`, the probability of yes. Example:
+  `{"type": "yes_no", "yes": 0.97}`.
+- `choice`: `choice`, the chosen option; `probabilities`, an object of
+  probabilities by option name; and an optional `confidence`.
+- `score`: `position`, the probability-weighted position on the levels
+  from 0; `probabilities`, a list with one probability for each level;
+  and an optional `confidence`.
+
+The built-in checks of this build ask only yes-or-no questions.
+
+To compare a judgment with the user's answer, pair two records. The
+`call_id` of a `tool_before` record equals the `tool_use_id` of the
+`approval` record of the same call. The `approval` record holds the
+policy's decision and the user's answer.
+
+This pairing has a limit. Some servers use one call id again in one
+session. When a server sends no call id, the `openai-compat` and
+`openai-responses` adapters make one up as `call_<index>`, so ids
+repeat across turns. For an id that occurs more than once, the pairs
+are not certain. An analysis must drop such ids.
+
+Before a run ends, each interface waits for the judge requests in
+flight. The wait lasts at most two request timeouts and a short margin.
+When it lasts longer than about 100 milliseconds, the run prints one
+line on stderr. The line says that the run waits for judgment records
+and that Ctrl-C skips the wait.
+
+A Ctrl-C during the wait ends it. The records in flight are then lost.
+In a one-shot run, the exit status stays the status of the turn.
+
+A one-shot run that made a tool call ends with the `claim` check in
+flight. Thus its exit waits for that answer.
+
+These events can lose the records of the requests in flight:
+
+- a Ctrl-C during the turn;
+- a Ctrl-C during the wait at the end;
+- a kill.
+
+### Boot checks and doctor
+
+These problems stop the run at boot:
+
+- `judgments.instance` names an instance that config does not define.
+- The kind of the instance cannot serve as a judge. Only `typesafe`
+  can in this build.
+- The judge instance sets a key that its kind does not take, such as
+  `thinking`.
+- The user file sets a check to a value other than `off` or `log`.
+  The message names the valid values.
+- The user file sets `judgments.rules`.
+- A value has the wrong type in either file: a `judgments` that is
+  not a table, an `instance` that is not a string, a `checks` that is
+  not a table, or a `max_calls` that is not a positive integer.
+
+`doctor` shows a judgments section:
+
+- the judge instance with its kind, its endpoint, its model, and the
+  source of its key;
+- a note for an alias model id;
+- a warning when the judge has no usable key;
+- a warning for each key that a judge ignores: `effort` and
+  `context_window`;
+- each check with its action and the layer that set it;
+- `max_calls` and the layer that set it;
+- each project key that the trust rules ignore;
+- each problem that stops a run.
+
+Without `judgments.instance`, the section says that judgments are off.
 
 ## The system prompt
 
@@ -728,6 +1011,19 @@ privilege, move credentials, or raise cost:
   can hide the approval question or a preview.
 - It cannot set `prompt.base_file`. The base prompt holds the rules
   that the harness gives the model.
+- It cannot set `judgments.instance`. Only the user file turns
+  judgments on.
+- It cannot set `judgments.rules`. The run ignores the key with a
+  warning.
+- It cannot change the judge instance. When the user file names a
+  judge instance, the run ignores each key of the project's
+  `[providers.<name>]` table for that instance. A judge receives tool
+  input and output.
+- It can lower a check from `log` to `off`. It cannot raise a check.
+  The run ignores a project check value other than `off` or `log`,
+  with a warning.
+- It cannot raise `judgments.max_calls` above the user file's value,
+  or above the default `500`.
 
 The project's instruction file is prompt content. It joins the prompt
 without a question. It cannot raise privilege, because each tool call
@@ -763,4 +1059,6 @@ M3 step 2 ([`m3-plan.md`](m3-plan.md)) added provider instances,
 `[roles.<name>] chain`, the fallback chain, and
 `/model <provider> <model>` on 2026-11-08. M3 step 7 added the composed
 system prompt, the instruction files, the profile file, and
-`prompt.base_file` on 2026-11-12.
+`prompt.base_file` on 2026-11-12. M3 step 8a added the `typesafe`
+judge kind, the `[judgments]` table with `instance`, `checks`, and
+`max_calls`, and the `judgment` record on 2026-11-15.

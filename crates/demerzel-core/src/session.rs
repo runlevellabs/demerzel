@@ -10,10 +10,10 @@
 //! The first record is metadata. A later meta record marks a resume
 //! or a model switch; the last meta record describes the current
 //! run. Every other record is one event: a message, an approval
-//! decision, a usage report, or a turn end. Readers skip record
-//! types they do not know, so old binaries read new files. A torn
-//! final line — a crash mid-append — is dropped on replay and
-//! truncated away on resume.
+//! decision, a usage report, a tool call, a turn end, or a judge's
+//! answers. Readers skip record types they do not know, so old
+//! binaries read new files. A torn final line — a crash mid-append —
+//! is dropped on replay and truncated away on resume.
 //!
 //! The file is also the measurement trace for one session. Meta
 //! records carry the project, provider, and model. Messages carry tool
@@ -27,15 +27,17 @@
 //! file says when each call ran and how long it took. A file from
 //! before the clock fields replays the same; the fields are absent.
 
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
 use crate::approval::{ApprovalDecision, ApprovalMode};
+use crate::judge::JudgeUsage;
 use crate::message::{Message, Usage};
 use crate::paths;
 use crate::provider::Effort;
@@ -43,6 +45,9 @@ use crate::route::Target;
 
 /// Version of the session-file schema, written into every meta record.
 pub const SCHEMA_VERSION: u32 = 1;
+
+/// The `type` of a `judgment` record.
+const JUDGMENT_TAG: &str = "judgment";
 
 /// The clock format of the `usage`, `tool`, and `turn` records: RFC
 /// 3339 in UTC at millisecond precision. `meta.created` keeps the
@@ -247,10 +252,76 @@ pub enum SessionRecord {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         duration_ms: Option<u64>,
     },
+    /// One judge request and its answers. Replay and resume skip it;
+    /// see [`JudgmentRecord`].
+    Judgment(JudgmentRecord),
     /// A record type from a newer schema. Replay skips it, so old
     /// binaries read new files. The harness never writes this variant.
     #[serde(other)]
     Unknown,
+}
+
+/// One judge request with its answers, or its failure. The record
+/// completes off the turn's path, so it can land after records that
+/// follow its event; `at` places it. A `tool_before` record pairs with
+/// the `approval` record whose `tool_use_id` equals its `call_id`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct JudgmentRecord {
+    /// "tool_before", "tool_after", or "turn_end".
+    pub event: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    /// Each check that asked in the request, with the action config
+    /// sets for it. What the answers made fire is not here.
+    pub checks: BTreeMap<String, String>,
+    /// The judge instance name.
+    pub instance: String,
+    /// The model id from the reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Each answer by question id, as [`crate::Answer`] serializes
+    /// it. JSON values, so an answer type from a later build does not
+    /// stop this build from reading the file.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub answers: BTreeMap<String, serde_json::Value>,
+    /// The state's UTF-8 length.
+    pub state_bytes: u64,
+    /// Lowercase hex SHA-256 of the state's bytes.
+    pub state_sha256: String,
+    /// When the request started, in the clock format of the other
+    /// records.
+    pub at: String,
+    pub duration_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<JudgeUsage>,
+    /// "timeout", or the error text, cut at 1 KiB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl JudgmentRecord {
+    /// A record of `event` from judge instance `instance`, with every
+    /// other field empty.
+    pub fn new(event: impl Into<String>, instance: impl Into<String>) -> Self {
+        Self {
+            event: event.into(),
+            call_id: None,
+            tool: None,
+            checks: BTreeMap::new(),
+            instance: instance.into(),
+            model: None,
+            answers: BTreeMap::new(),
+            state_bytes: 0,
+            state_sha256: String::new(),
+            at: String::new(),
+            duration_ms: 0,
+            usage: None,
+            error: None,
+        }
+    }
 }
 
 /// Borrowed mirror of [`SessionRecord`], so appends serialize without
@@ -301,6 +372,7 @@ enum RecordRef<'a> {
         #[serde(skip_serializing_if = "Option::is_none")]
         duration_ms: Option<u64>,
     },
+    Judgment(&'a JudgmentRecord),
 }
 
 /// The record type alone. Only the replay error path uses it, to name
@@ -396,7 +468,7 @@ impl SessionStore {
         let mut session = Session {
             id,
             path,
-            file,
+            file: Arc::new(Mutex::new(Appender::new(file))),
             cwd: project.to_path_buf(),
             meta: None,
             buf: Vec::new(),
@@ -463,7 +535,10 @@ impl SessionStore {
 pub struct Session {
     id: String,
     path: PathBuf,
-    file: File,
+    /// The append handle, shared with every [`SessionWriter`]: each
+    /// line goes out in one write under the lock, and the file closes
+    /// when the last handle drops.
+    file: Arc<Mutex<Appender<File>>>,
     /// The project directory the session is scoped to, kept so a
     /// mid-run meta record — a model switch — names the same project
     /// as the one that opened the file.
@@ -560,6 +635,7 @@ impl Session {
                 at: at.as_deref(),
                 duration_ms: *duration_ms,
             },
+            SessionRecord::Judgment(record) => RecordRef::Judgment(record),
             // Replay-only marker; there is nothing to write.
             SessionRecord::Unknown => return Ok(()),
         };
@@ -660,7 +736,16 @@ impl Session {
         self.buf.clear();
         serde_json::to_writer(&mut self.buf, record).map_err(io::Error::other)?;
         self.buf.push(b'\n');
-        self.file.write_all(&self.buf)
+        write_line(&self.file, &self.buf)
+    }
+
+    /// An append handle on this session's file, for records that
+    /// complete off the turn's path. The handle keeps the file open
+    /// after the session drops.
+    pub fn writer(&self) -> SessionWriter {
+        SessionWriter {
+            file: Arc::clone(&self.file),
+        }
     }
 
     /// Reopen an existing session file for appending and rebuild its
@@ -692,13 +777,118 @@ impl Session {
             Self {
                 id,
                 path: path.to_path_buf(),
-                file,
+                file: Arc::new(Mutex::new(Appender::new(file))),
                 cwd,
                 meta: replay.meta.clone(),
                 buf: Vec::new(),
             },
             replay,
         ))
+    }
+}
+
+/// A cloneable append handle on one session's file, for records that
+/// complete off the turn's path. Every line goes out in one write
+/// under the file's lock, so lines from the session and from each
+/// clone never interleave. The file closes when the last handle drops.
+#[derive(Debug, Clone)]
+pub struct SessionWriter {
+    file: Arc<Mutex<Appender<File>>>,
+}
+
+impl SessionWriter {
+    /// Append one `judgment` record as one line.
+    pub fn append_judgment(&self, record: &JudgmentRecord) -> io::Result<()> {
+        let mut line =
+            serde_json::to_vec(&RecordRef::Judgment(record)).map_err(io::Error::other)?;
+        line.push(b'\n');
+        write_line(&self.file, &line)
+    }
+}
+
+/// Write one complete line under the file's lock. The lock guards
+/// state that every append keeps whole, so a poisoned lock still
+/// writes.
+fn write_line(file: &Mutex<Appender<File>>, line: &[u8]) -> io::Result<()> {
+    file.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .append(line)
+}
+
+/// A file a line goes to, as [`Appender`] needs it.
+trait LineFile {
+    /// One write call: the bytes it took.
+    fn write_some(&mut self, bytes: &[u8]) -> io::Result<usize>;
+    fn length(&mut self) -> io::Result<u64>;
+    fn cut_to(&mut self, length: u64) -> io::Result<()>;
+}
+
+impl LineFile for File {
+    fn write_some(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.write(bytes)
+    }
+
+    fn length(&mut self) -> io::Result<u64> {
+        Ok(self.metadata()?.len())
+    }
+
+    fn cut_to(&mut self, length: u64) -> io::Result<()> {
+        self.set_len(length)
+    }
+}
+
+/// The append side of a session file, shared by the session and its
+/// writers.
+#[derive(Debug)]
+struct Appender<F> {
+    file: F,
+    /// Set when a failed append could not be cut back: the file ends in
+    /// a fragment, and a later line would join it.
+    torn: bool,
+}
+
+impl<F: LineFile> Appender<F> {
+    fn new(file: F) -> Self {
+        Self { file, torn: false }
+    }
+
+    /// Append one whole line or nothing: a write that fails part way,
+    /// as on a full disk, is cut back by the bytes it wrote, so no
+    /// fragment joins the next line and the file stays readable. A
+    /// write that succeeds makes no other system call. When the cut
+    /// fails too, every later append fails: a resume cuts the fragment
+    /// away.
+    fn append(&mut self, line: &[u8]) -> io::Result<()> {
+        if self.torn {
+            return Err(io::Error::other(
+                "the session file ends in a partial line from a failed write; resume the \
+                 session to repair it",
+            ));
+        }
+        // `write_all`, with a count of the bytes written.
+        let mut written = 0;
+        let error = loop {
+            if written == line.len() {
+                return Ok(());
+            }
+            match self.file.write_some(&line[written..]) {
+                Ok(0) => break io::Error::from(io::ErrorKind::WriteZero),
+                Ok(n) => written += n,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => break error,
+            }
+        };
+        if written > 0 {
+            let cut = self
+                .file
+                .length()
+                .and_then(|length| self.file.cut_to(length.saturating_sub(written as u64)));
+            if let Err(cut) = cut {
+                log::error!("session file: a failed append left a partial line: {cut}");
+                self.torn = true;
+            }
+        }
+        Err(error)
     }
 }
 
@@ -770,6 +960,12 @@ pub fn replay(path: &Path) -> io::Result<Replay> {
                 let kind = serde_json::from_str::<RecordTag<'_>>(trimmed)
                     .ok()
                     .and_then(|tag| tag.kind);
+                // Replay does not read judgment records, so their shape
+                // can change in a later build: one that does not parse
+                // is skipped by its tag.
+                if kind.as_deref() == Some(JUDGMENT_TAG) {
+                    continue;
+                }
                 return Err(match kind {
                     Some(kind) => bad(&format!("bad {kind} record"), error.to_string()),
                     None => bad("bad session record", error.to_string()),
@@ -818,7 +1014,9 @@ pub fn replay(path: &Path) -> io::Result<Replay> {
                 call_id,
                 duration: Duration::from_millis(duration_ms),
             }),
-            SessionRecord::Approval { .. } | SessionRecord::Turn { .. } => {}
+            SessionRecord::Approval { .. }
+            | SessionRecord::Turn { .. }
+            | SessionRecord::Judgment(_) => {}
             SessionRecord::Unknown => {}
         }
     }
@@ -1317,6 +1515,9 @@ mod tests {
                 at: None,
                 duration_ms: None,
             },
+            SessionRecord::Judgment(full_judgment()),
+            // The optional fields absent.
+            SessionRecord::Judgment(JudgmentRecord::new("turn_end", "judge")),
         ];
         for record in &records {
             session.append(record).unwrap();
@@ -1327,6 +1528,333 @@ mod tests {
         for (line, record) in lines[1..].iter().zip(&records) {
             assert_eq!(*line, serde_json::to_string(record).unwrap());
         }
+    }
+
+    /// A `judgment` record with every field set.
+    fn full_judgment() -> JudgmentRecord {
+        let mut record = JudgmentRecord::new("tool_after", "judge");
+        record.call_id = Some("call_3".into());
+        record.tool = Some("bash".into());
+        record.checks.insert("outcome".into(), "log".into());
+        record.checks.insert("progress".into(), "log".into());
+        record.model = Some("judge-1.0.0".into());
+        record.answers.insert(
+            "outcome".into(),
+            serde_json::to_value(crate::judge::Answer::yes_no(0.875)).unwrap(),
+        );
+        record.answers.insert(
+            "progress".into(),
+            serde_json::json!({"type": "yes_no", "yes": 0.5}),
+        );
+        record.state_bytes = 1234;
+        record.state_sha256 = "ab".repeat(32);
+        record.at = "2026-09-01T10:00:00.123Z".into();
+        record.duration_ms = 210;
+        record.usage = Some(JudgeUsage::new(400, 9));
+        record.error = Some("timeout".into());
+        record
+    }
+
+    #[test]
+    fn a_judgment_record_has_its_field_names_and_round_trips() {
+        let record = SessionRecord::Judgment(full_judgment());
+        let value = serde_json::to_value(&record).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "judgment",
+                "event": "tool_after",
+                "call_id": "call_3",
+                "tool": "bash",
+                "checks": {"outcome": "log", "progress": "log"},
+                "instance": "judge",
+                "model": "judge-1.0.0",
+                "answers": {
+                    "outcome": {"type": "yes_no", "yes": 0.875},
+                    "progress": {"type": "yes_no", "yes": 0.5}
+                },
+                "state_bytes": 1234,
+                "state_sha256": "ab".repeat(32),
+                "at": "2026-09-01T10:00:00.123Z",
+                "duration_ms": 210,
+                "usage": {"input_tokens": 400, "output_tokens": 9},
+                "error": "timeout"
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<SessionRecord>(value).unwrap(),
+            record
+        );
+
+        // The optional fields stay out when empty, and come back empty.
+        let sparse = SessionRecord::Judgment(JudgmentRecord::new("turn_end", "judge"));
+        let value = serde_json::to_value(&sparse).unwrap();
+        for absent in ["call_id", "tool", "model", "answers", "usage", "error"] {
+            assert!(value.get(absent).is_none(), "{absent}: {value}");
+        }
+        assert_eq!(
+            serde_json::from_value::<SessionRecord>(value).unwrap(),
+            sparse
+        );
+    }
+
+    #[test]
+    fn replay_and_resume_skip_judgment_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::at(dir.path());
+        let mut session = store
+            .create(&SessionOpen::new(dir.path(), "p", "p", "m"))
+            .unwrap();
+        session
+            .append_message(&text_message(Role::User, "hi"))
+            .unwrap();
+        session.writer().append_judgment(&full_judgment()).unwrap();
+        session
+            .append_message(&text_message(Role::Assistant, "hello"))
+            .unwrap();
+        let path = session.path().to_path_buf();
+        let replayed = replay(&path).unwrap();
+        assert_eq!(replayed.messages.len(), 2);
+        assert!(replayed.usage.is_empty());
+        assert!(replayed.tools.is_empty());
+        drop(session);
+
+        let (mut resumed, replayed) = Session::resume(&path).unwrap();
+        assert_eq!(replayed.messages.len(), 2);
+        resumed.writer().append_judgment(&full_judgment()).unwrap();
+        resumed
+            .append_message(&text_message(Role::User, "more"))
+            .unwrap();
+        assert_eq!(replay(&path).unwrap().messages.len(), 3);
+    }
+
+    #[test]
+    fn a_writer_clone_appends_after_the_session_drops() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::at(dir.path());
+        let mut session = store
+            .create(&SessionOpen::new(dir.path(), "p", "p", "m"))
+            .unwrap();
+        let path = session.path().to_path_buf();
+        let writer = session.writer().clone();
+        session
+            .append_message(&text_message(Role::User, "hi"))
+            .unwrap();
+        drop(session);
+        writer.append_judgment(&full_judgment()).unwrap();
+        drop(writer);
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let last: SessionRecord = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+        assert_eq!(last, SessionRecord::Judgment(full_judgment()));
+        assert_eq!(replay(&path).unwrap().messages.len(), 1);
+    }
+
+    #[test]
+    fn concurrent_appends_from_writer_clones_and_the_session_stay_whole_lines() {
+        const EACH: usize = 100;
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::at(dir.path());
+        let mut session = store
+            .create(&SessionOpen::new(dir.path(), "p", "p", "m"))
+            .unwrap();
+        // Long lines, so an interleaved write would tear one.
+        let mut record = full_judgment();
+        record.error = Some("x".repeat(32 * 1024));
+        let writers = [session.writer(), session.writer().clone()];
+        std::thread::scope(|scope| {
+            for (index, writer) in writers.iter().enumerate() {
+                let mut record = record.clone();
+                record.instance = format!("judge-{index}");
+                scope.spawn(move || {
+                    for _ in 0..EACH {
+                        writer.append_judgment(&record).unwrap();
+                    }
+                });
+            }
+            let text = "y".repeat(16 * 1024);
+            for _ in 0..EACH {
+                session
+                    .append_message(&text_message(Role::User, &text))
+                    .unwrap();
+            }
+        });
+
+        let text = std::fs::read_to_string(session.path()).unwrap();
+        let mut judgments = [0usize; 2];
+        let mut messages = 0;
+        for line in text.lines() {
+            match serde_json::from_str::<SessionRecord>(line).unwrap() {
+                SessionRecord::Judgment(judgment) => {
+                    let index = usize::from(judgment.instance == "judge-1");
+                    judgments[index] += 1;
+                }
+                SessionRecord::Message(_) => messages += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(judgments, [EACH, EACH]);
+        assert_eq!(messages, EACH);
+        assert_eq!(replay(session.path()).unwrap().messages.len(), EACH);
+    }
+
+    #[test]
+    fn a_judgment_record_that_does_not_parse_still_replays_and_resumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::at(dir.path());
+        let project = dir.path().to_path_buf();
+        let mut session = store
+            .create(&SessionOpen::new(&project, "p", "p", "m"))
+            .unwrap();
+        session
+            .append_message(&text_message(Role::User, "hi"))
+            .unwrap();
+        let full = serde_json::to_value(RecordRef::Judgment(&full_judgment())).unwrap();
+        // One record without a required field, one with a field of
+        // another type.
+        let mut missing = full.clone();
+        missing.as_object_mut().unwrap().remove("state_sha256");
+        let mut retyped = full;
+        retyped["state_bytes"] = serde_json::json!("many");
+        use std::io::Write as _;
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(session.path())
+            .unwrap();
+        writeln!(file, "{missing}").unwrap();
+        writeln!(file, "{retyped}").unwrap();
+        drop(file);
+        session
+            .append_message(&text_message(Role::Assistant, "hello"))
+            .unwrap();
+        let path = session.path().to_path_buf();
+        drop(session);
+
+        assert_eq!(replay(&path).unwrap().messages.len(), 2);
+        let (mut resumed, replayed) = Session::resume(&path).unwrap();
+        assert_eq!(replayed.messages.len(), 2);
+        resumed
+            .append_message(&text_message(Role::User, "again"))
+            .unwrap();
+        assert_eq!(replay(resumed.path()).unwrap().messages.len(), 3);
+
+        // Any other record that does not parse still stops the replay.
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(resumed.path())
+            .unwrap();
+        writeln!(file, r#"{{"type":"message","role":7}}"#).unwrap();
+        drop(file);
+        assert!(replay(resumed.path()).is_err());
+    }
+
+    /// A file that writes part of a line, then fails, as a full disk
+    /// does.
+    struct FullDisk {
+        bytes: Vec<u8>,
+        room: usize,
+        /// Whether a cut fails too.
+        stuck: bool,
+    }
+
+    impl LineFile for FullDisk {
+        fn length(&mut self) -> io::Result<u64> {
+            Ok(self.bytes.len() as u64)
+        }
+
+        fn write_some(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.room == 0 {
+                return Err(io::Error::new(io::ErrorKind::StorageFull, "no space"));
+            }
+            let fits = bytes.len().min(self.room);
+            self.bytes.extend_from_slice(&bytes[..fits]);
+            self.room -= fits;
+            Ok(fits)
+        }
+
+        fn cut_to(&mut self, length: u64) -> io::Result<()> {
+            if self.stuck {
+                return Err(io::Error::other("read-only"));
+            }
+            self.bytes.truncate(length as usize);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_failed_append_leaves_no_partial_line() {
+        let line = b"{\"type\":\"turn\"}\n";
+        let mut file = Appender::new(FullDisk {
+            bytes: Vec::new(),
+            room: 30,
+            stuck: false,
+        });
+        file.append(line).unwrap();
+        let error = file
+            .append(b"{\"type\":\"judgment\",\"x\":1}\n")
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::StorageFull);
+        // The file holds the first line whole and nothing of the second.
+        assert_eq!(file.file.bytes, line);
+        file.file.room = 100;
+        file.append(line).unwrap();
+        assert_eq!(file.file.bytes, [&line[..], &line[..]].concat());
+    }
+
+    /// A file whose writes take a few bytes each and are interrupted
+    /// once.
+    struct Choppy {
+        bytes: Vec<u8>,
+        interrupted: bool,
+    }
+
+    impl LineFile for Choppy {
+        fn write_some(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            let fits = bytes.len().min(3);
+            self.bytes.extend_from_slice(&bytes[..fits]);
+            Ok(fits)
+        }
+
+        fn length(&mut self) -> io::Result<u64> {
+            unreachable!("a write that succeeds reads no length")
+        }
+
+        fn cut_to(&mut self, _: u64) -> io::Result<()> {
+            unreachable!("a write that succeeds cuts nothing")
+        }
+    }
+
+    #[test]
+    fn a_short_or_interrupted_write_goes_on_to_the_whole_line() {
+        let line = b"{\"type\":\"turn\"}\n";
+        let mut file = Appender::new(Choppy {
+            bytes: Vec::new(),
+            interrupted: false,
+        });
+        file.append(line).unwrap();
+        assert_eq!(file.file.bytes, line);
+    }
+
+    #[test]
+    fn a_fragment_that_cannot_be_cut_stops_every_later_append() {
+        let line = b"{\"type\":\"turn\"}\n";
+        let mut file = Appender::new(FullDisk {
+            bytes: Vec::new(),
+            room: 20,
+            stuck: true,
+        });
+        file.append(line).unwrap();
+        assert!(file.append(line).is_err());
+        // The fragment stays, and no later line joins it.
+        let torn = file.file.bytes.clone();
+        assert_eq!(torn.len(), 20);
+        file.file.room = 100;
+        assert!(file.append(line).is_err());
+        assert_eq!(file.file.bytes, torn);
     }
 
     #[test]
@@ -1348,9 +1876,36 @@ mod tests {
             .unwrap();
         writeln!(file, r#"{{"type":"hologram","data":42}}"#).unwrap();
         drop(file);
+        session.writer().append_judgment(&full_judgment()).unwrap();
 
         let replayed = replay(session.path()).unwrap();
         assert_eq!(replayed.messages.len(), 1);
+
+        // A reader from before the `judgment` record skips it through
+        // its unknown arm, nested members and all.
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum OldRecord {
+            Meta(SessionMeta),
+            Message(Message),
+            #[serde(other)]
+            Unknown,
+        }
+        let text = std::fs::read_to_string(session.path()).unwrap();
+        let old: Vec<OldRecord> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(matches!(&old[0], OldRecord::Meta(meta) if meta.provider == "p"));
+        assert!(matches!(&old[1], OldRecord::Message(message) if message.role == Role::User));
+        assert!(matches!(old[2], OldRecord::Unknown));
+        assert!(matches!(old[3], OldRecord::Unknown));
+        assert!(
+            text.lines()
+                .last()
+                .unwrap()
+                .contains("\"type\":\"judgment\"")
+        );
     }
 
     #[test]

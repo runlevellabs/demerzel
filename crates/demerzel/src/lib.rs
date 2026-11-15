@@ -9,6 +9,7 @@ mod commands;
 pub mod config;
 pub mod doctor;
 mod git;
+mod judgments;
 pub mod login;
 mod preview;
 mod prompt;
@@ -40,6 +41,13 @@ use crate::doctor::credential_states;
 /// First line an interactive interface prints on stderr. The PTY boot
 /// probe waits for it; the TUI prints it before the alternate screen.
 pub const READY_MARKER: &str = "demerzel ready";
+
+/// What [`Runtime::settle_at_exit`] prints when its wait lasts.
+pub const WAIT_LINE: &str = "waiting for judgment records; Ctrl-C skips the wait";
+
+/// How long [`Runtime::settle_at_exit`] waits before it says that it
+/// waits.
+pub const WAIT_LINE_AFTER: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Which session a run opens at its first prompt.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -200,6 +208,10 @@ pub struct RunConfig {
     /// `prompt.base_file` resolves to. `None` keeps the harness
     /// default. [`Runtime::new`] refuses a file it cannot read.
     pub prompt_base_file: Option<PathBuf>,
+    /// The run's judgments: the judge instance, one of
+    /// [`RunConfig::other_instances`], each check's action, and the
+    /// call cap. `None`, the default, sends no judgment request.
+    pub judgments: Option<config::Judgments>,
 }
 
 impl RunConfig {
@@ -227,6 +239,7 @@ impl RunConfig {
             theme: Theme::default(),
             config_dir: None,
             prompt_base_file: None,
+            judgments: None,
         }
     }
 }
@@ -259,6 +272,9 @@ pub struct Runtime {
     /// The content of `prompt.base_file`, read at boot. `None` keeps
     /// the harness default.
     base_prompt: Option<String>,
+    /// The run's judgments; `None` without `RunConfig::judgments` or
+    /// with every check off. Each opened session gets its own host.
+    judging: Option<judgments::Judging>,
 }
 
 /// A session open for its first prompt.
@@ -436,6 +452,26 @@ impl Runtime {
             None => None,
         };
 
+        // The judge instance must be one the run knows and one that
+        // can judge. Its judge builds at the first check, not here.
+        let judging = match &config.judgments {
+            Some(judgments) => {
+                let Some(entry) = providers.entry(&judgments.instance) else {
+                    return Err(RunError::Config(format!(
+                        "`judgments.instance` names provider `{}`, which the config does not \
+                         define",
+                        judgments.instance
+                    )));
+                };
+                let instance = entry.resolved.instance.clone();
+                if let Some(problem) = config::judge_problems(&instance).into_iter().next() {
+                    return Err(RunError::Config(problem));
+                }
+                judgments::Judging::new(judgments, instance, config.auth.clone())
+            }
+            None => None,
+        };
+
         Ok(Self {
             config,
             providers,
@@ -443,6 +479,7 @@ impl Runtime {
             read_only_registry,
             store,
             base_prompt,
+            judging,
         })
     }
 
@@ -688,6 +725,12 @@ impl Runtime {
         // host.
         engine_config.effort = settings.effort;
         engine_config.max_model_calls = self.config.max_model_calls;
+        // The host takes the session's writer, so its records land in
+        // this session's file after a `/new` too.
+        let host = self
+            .judging
+            .as_ref()
+            .map(|judging| judging.host(session.writer()));
         let mut parts = EngineParts::new(
             &self.providers,
             self.tools(settings.approval),
@@ -696,6 +739,9 @@ impl Runtime {
             session,
         );
         parts.history = replay.messages;
+        if let Some(host) = host {
+            parts.host = Some(Box::new(host));
+        }
         Ok(Opened {
             engine: Engine::new(parts),
             settings,
@@ -879,10 +925,79 @@ impl Runtime {
         }
     }
 
+    /// The judgment notices since the last call: a session that
+    /// reached the judgment call cap, and the first failed judge
+    /// build of a session. Each interface shows them after a turn.
+    /// Empty without judgments.
+    pub fn take_notices(&self) -> Vec<String> {
+        self.judging
+            .as_ref()
+            .map(judgments::Judging::take_notices)
+            .unwrap_or_default()
+    }
+
+    /// Wait for the judgment requests in flight, so their records
+    /// land in the session files. A request waits at most the request
+    /// timeout for a permit and gets the full timeout once it has one,
+    /// so the wait lasts at most two timeouts and a short grace.
+    /// Returns at once without judgments or with no request in flight.
+    pub async fn settle(&self) {
+        if let Some(judging) = &self.judging {
+            judging.settle().await;
+        }
+    }
+
+    /// [`Runtime::settle`] at the end of a run, for an interface:
+    /// Ctrl-C ends the wait at any point, and a wait that lasts longer
+    /// than [`WAIT_LINE_AFTER`] prints [`WAIT_LINE`] on stderr. Then the
+    /// judgment notices not shown yet go to stderr. A record still in
+    /// flight after a Ctrl-C is lost.
+    pub async fn settle_at_exit(&self) {
+        self.settle_at_exit_or(std::future::pending()).await;
+    }
+
+    /// [`Runtime::settle_at_exit`] that `interrupt` ends too: an
+    /// interface's own interrupt signal stream, which holds a Ctrl-C
+    /// that came before the wait started.
+    pub async fn settle_at_exit_or(&self, interrupt: impl std::future::Future<Output = ()>) {
+        if let Some(judging) = &self.judging
+            && judging.in_flight() > 0
+        {
+            let wait = judging.settle();
+            let line = tokio::time::sleep(WAIT_LINE_AFTER);
+            // The signal is watched from the first poll. A failed
+            // registration leaves the wait to its bound.
+            let ctrl_c = async {
+                if tokio::signal::ctrl_c().await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            };
+            tokio::pin!(wait, line, ctrl_c, interrupt);
+            let mut said = false;
+            loop {
+                tokio::select! {
+                    biased;
+                    () = &mut ctrl_c => break log::warn!("judgments: Ctrl-C skipped the wait"),
+                    () = &mut interrupt => break log::warn!("judgments: Ctrl-C skipped the wait"),
+                    () = &mut wait => break,
+                    () = &mut line, if !said => {
+                        said = true;
+                        eprintln!("demerzel: {WAIT_LINE}");
+                    }
+                }
+            }
+        }
+        for notice in self.take_notices() {
+            eprintln!("demerzel: {notice}");
+        }
+    }
+
     /// Run one prompt to completion. Display events go to `sink`; the
     /// returned outcome says how the turn ended. A fallback notice of
     /// the open and its prompt notes go to stderr, as the interfaces
-    /// show theirs.
+    /// show theirs. The judgment requests of the turn can still be in
+    /// flight: the caller settles them, with [`Runtime::settle`] or
+    /// [`Runtime::settle_at_exit`].
     pub async fn one_shot(
         &self,
         prompt: String,
@@ -937,28 +1052,31 @@ fn stored_instance_key(
     }
 }
 
+/// The key in the instance's own key variable. It wins over every
+/// other source. Named but unset, it stops the turn with its name.
+fn named_key(instance: &config::Instance) -> Result<Option<String>, RunError> {
+    let Some(variable) = &instance.api_key_env else {
+        return Ok(None);
+    };
+    let key = std::env::var(variable)
+        .ok()
+        .filter(|key| !key.is_empty())
+        .ok_or_else(|| {
+            RunError::Auth(ProviderError::Auth(format!(
+                "provider `{}` reads its key from {variable}, and {variable} is unset or empty",
+                instance.name
+            )))
+        })?;
+    Ok(Some(key))
+}
+
 /// Build the provider of `instance`, with its credentials.
 fn build_provider(
     instance: &config::Instance,
     auth: Option<&AuthPaths>,
 ) -> Result<Box<dyn Provider>, RunError> {
     let name = &instance.name;
-    // The instance's own key variable wins over every other source.
-    // Named but unset, it stops the turn with its name.
-    let named_key = match &instance.api_key_env {
-        Some(variable) => Some(
-            std::env::var(variable)
-                .ok()
-                .filter(|key| !key.is_empty())
-                .ok_or_else(|| {
-                    RunError::Auth(ProviderError::Auth(format!(
-                        "provider `{name}` reads its key from {variable}, and {variable} \
-                         is unset or empty"
-                    )))
-                })?,
-        ),
-        None => None,
-    };
+    let named_key = named_key(instance)?;
     match instance.kind.as_str() {
         openai_codex::PROVIDER_ID => {
             let mut store = open_store(auth)?;
@@ -1044,6 +1162,7 @@ fn fallback_notice(id: &str, meta: &SessionMeta, settings: &SessionSettings, why
 fn unknown_provider(other: &str) -> RunError {
     let known: Vec<String> = demerzel_providers::PROVIDER_IDS
         .iter()
+        .filter(|id| demerzel_providers::adapter_rules(id).is_some_and(|rules| rules.serves_model))
         .map(|id| format!("`{id}`"))
         .collect();
     RunError::Config(format!(
@@ -1060,13 +1179,20 @@ fn find_session(store: &SessionStore, project: &Path, id: &str) -> Result<PathBu
         .ok_or_else(|| RunError::Config(format!("no session `{id}` in this project")))
 }
 
-/// Build a runtime and run one prompt. A repeated caller builds one
-/// [`Runtime`] and calls [`Runtime::one_shot`], so the HTTP connection
-/// pool persists between calls.
+/// Build a runtime, run one prompt, and settle its judgment requests.
+/// A repeated caller builds one [`Runtime`] and calls
+/// [`Runtime::one_shot`], so the HTTP connection pool persists between
+/// calls.
 pub async fn run_one_shot(
     config: &RunConfig,
     prompt: String,
     sink: &dyn EventSink,
 ) -> Result<TurnOutcome, RunError> {
-    Runtime::new(config.clone())?.one_shot(prompt, sink).await
+    let runtime = Runtime::new(config.clone())?;
+    let outcome = runtime.one_shot(prompt, sink).await;
+    runtime.settle().await;
+    for notice in runtime.take_notices() {
+        eprintln!("demerzel: {notice}");
+    }
+    outcome
 }

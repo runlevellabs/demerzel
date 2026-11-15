@@ -753,6 +753,40 @@ fn a_tail_on_an_undefined_instance_stops_the_run_at_boot() {
 }
 
 #[tokio::test]
+async fn a_judge_only_instance_is_never_a_head_a_tail_or_a_model_switch() {
+    let bed = Bed::start(Vec::new()).await;
+    let text = "[providers.judge]\nkind = \"typesafe\"\n\
+                api_key_env = \"DMZ_TEST_JUDGE_KEY_NEVER_SET\"\n";
+    let user = demerzel::config::Layer::parse(text).unwrap().0;
+    for name in ["judge", "typesafe"] {
+        // As the head, the run stops at boot.
+        let mut config = bed.config();
+        config.instance = demerzel::config::Instance::new(name, "typesafe");
+        config.model = "jev-1.14.0".into();
+        let Err(RunError::Config(error)) = Runtime::new(config) else {
+            panic!("a judge-only head must stop the run");
+        };
+        assert!(error.contains(&format!("`{name}`")), "{error}");
+        // As a fallback target, too.
+        let config = chain_run(&bed, &user, vec![Target::new(name, "jev-1.14.0")]);
+        let Err(RunError::Config(error)) = Runtime::new(config) else {
+            panic!("a judge-only fallback target must stop the run");
+        };
+        assert!(error.contains(&format!("`{name}`")), "{error}");
+    }
+    // `/model` refuses to switch to it.
+    let runtime = Runtime::new(chain_run(&bed, &user, Vec::new())).unwrap();
+    let settings = SessionSettings::from_config(runtime.config());
+    for name in ["judge", "typesafe"] {
+        let error = runtime
+            .switch_head(&settings, name, "jev-1.14.0")
+            .unwrap_err();
+        assert!(error.contains(&format!("`{name}`")), "{error}");
+    }
+    assert!(bed.mock.received().is_empty());
+}
+
+#[tokio::test]
 async fn the_first_run_screen_shows_only_when_no_target_of_the_route_can_run() {
     let bed = Bed::start(Vec::new()).await;
     let url = format!("{}/v1", bed.mock.url());

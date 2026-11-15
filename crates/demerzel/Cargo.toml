@@ -22,6 +22,7 @@ log = { workspace = true }
 reqwest = { workspace = true }
 rustyline = { workspace = true, features = ["with-file-history"] }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "net", "signal", "sync", "time"] }
 toml = { workspace = true }

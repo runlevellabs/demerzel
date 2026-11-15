@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 import unittest
 from unittest.mock import patch
 
@@ -34,6 +35,12 @@ TRANSCRIPT = {
         {"text": "done"},
     ],
 }
+JUDGE = {
+    "model": "judge-9.9.9",
+    "requests": 2,
+    "answers": {"outcome": {"type": "noul", "noul": 0.25}, "claim": {"type": "noul", "noul": 0.75}},
+}
+JUDGED_TRANSCRIPT = dict(TRANSCRIPT, judge=JUDGE)
 MOCK_URL = "http://127.0.0.1:9"
 
 # The mock stand-in follows the mock's protocol: the base URL, then
@@ -51,7 +58,12 @@ print("not a url" if mode == "garbage" else {url!r}, flush=True)
 if mode == "garbage":
     time.sleep(60)
 sys.stdin.read()
-replies = len(json.load(open(sys.argv[1]))["replies"])
+document = json.load(open(sys.argv[1]))
+replies = len(document["replies"])
+judge = document.get("judge")
+counts = {{"served": replies, "unused": 0, "refused": 0}}
+if (judge is not None and mode != "three-keys") or mode == "four-keys":
+    counts["judged"] = (judge or {{}}).get("requests", 0) + (mode == "judged-off")
 if mode == "malformed":
     print("{{not json", flush=True)
 elif mode == "unused":
@@ -63,20 +75,21 @@ elif mode == "two-keys":
 elif mode == "negative":
     print(json.dumps({{"served": replies, "unused": 0, "refused": -1}}), flush=True)
 elif mode != "no-count":
-    print(json.dumps({{"served": replies, "unused": 0, "refused": 0}}), flush=True)
+    print(json.dumps(counts), flush=True)
 """
 
-# The agent stand-in: record the process ID, the environment, and the
-# arguments, check that the config points at the mock, then act.
+# The agent stand-in: record the process ID, the environment, the
+# arguments, and the config file, check that the config points at the
+# mock, then act.
 AGENT = """
 import json, os, signal, subprocess, sys, time
+with open(os.path.join(os.environ["XDG_CONFIG_HOME"], "demerzel", "config.toml")) as f:
+    config = f.read()
 with open({record!r} + ".tmp", "w") as f:
-    json.dump({{"pid": os.getpid(), "env": dict(os.environ), "argv": sys.argv}}, f)
+    json.dump({{"pid": os.getpid(), "env": dict(os.environ), "argv": sys.argv, "config": config}}, f)
 os.replace({record!r} + ".tmp", {record!r})
-config = os.path.join(os.environ["XDG_CONFIG_HOME"], "demerzel", "config.toml")
-with open(config) as f:
-    if {url!r} + "/v1" not in f.read():
-        sys.exit(3)
+if {url!r} + "/v1" not in config:
+    sys.exit(3)
 {action}
 """
 
@@ -247,6 +260,35 @@ class RunTests(SmokeTestCase):
                 self.assertIn("stage: mock count", output)
                 self.assert_mock_stopped()
 
+    def test_judged_task_passes_when_the_judged_count_matches(self):
+        write_json(self.tasks / "one" / "transcript.json", JUDGED_TRANSCRIPT)
+        status, output = self.run_smoke()
+        self.assertEqual(status, 0, output)
+
+    def test_judged_count_fails_the_task(self):
+        write_json(self.tasks / "one" / "transcript.json", JUDGED_TRANSCRIPT)
+        for mode in ("judged-off", "three-keys", "refused"):
+            with self.subTest(mode=mode):
+                self.mock = self.make_mock(mode)
+                status, output = self.run_smoke()
+                self.assertEqual(status, smoke.EXIT_FAILED, output)
+                self.assertIn("stage: mock count", output)
+
+    def test_judged_count_without_a_judge_member_is_malformed(self):
+        self.mock = self.make_mock("four-keys")
+        status, output = self.run_smoke()
+        self.assertEqual(status, smoke.EXIT_FAILED, output)
+        self.assertIn("stage: mock count", output)
+        self.assertIn("malformed", output)
+
+    def test_judge_model_is_any_text_in_the_config(self):
+        path = self.tmp / "config-home"
+        path.mkdir()
+        model = 'a "quoted" \\ model\x7f\u00e9'
+        smoke.write_config(path, MOCK_URL, dict(JUDGE, model=model))
+        config = tomllib.loads((path / "demerzel" / "config.toml").read_text())
+        self.assertEqual(config["providers"][smoke.JUDGE_INSTANCE]["model"], model)
+
     def test_mock_without_a_url_fails_without_a_hang(self):
         for mode in ("silent", "garbage", "exit"):
             with self.subTest(mode=mode):
@@ -313,21 +355,43 @@ class RunTests(SmokeTestCase):
             "DEMERZEL_LOG": "trace",
             "DEMERZEL_EVAL_BANK": str(self.tmp),
             "ANTHROPIC_API_KEY": "fake-key-for-test",
+            smoke.JUDGE_KEY_VARIABLE: "fake-parent-judge-key",
             "XDG_CONFIG_HOME": str(self.tmp / "user-config"),
         }
-        with patch.dict(os.environ, hostile):
-            status, output = self.run_smoke()
-        self.assertEqual(status, 0, output)
-        env = self.agent_record()["env"]
-        pinned = {name: value for name, value in env.items() if name.startswith("DEMERZEL_")}
-        self.assertEqual(pinned, {
-            "DEMERZEL_PROVIDER": smoke.INSTANCE,
-            "DEMERZEL_MODEL": smoke.MODEL,
-            "DEMERZEL_BASE_URL": MOCK_URL + "/v1",
-        })
-        self.assertNotIn("ANTHROPIC_API_KEY", env)
-        for name in ("HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"):
-            self.assertNotIn(env[name], (os.environ.get(name), hostile["XDG_CONFIG_HOME"]), name)
+        for judged in (False, True):
+            with self.subTest(judged=judged):
+                transcript = JUDGED_TRANSCRIPT if judged else TRANSCRIPT
+                write_json(self.tasks / "one" / "transcript.json", transcript)
+                self.record.unlink(missing_ok=True)
+                with patch.dict(os.environ, hostile):
+                    status, output = self.run_smoke()
+                self.assertEqual(status, 0, output)
+                record = self.agent_record()
+                env = record["env"]
+                pinned = {name: value for name, value in env.items() if name.startswith("DEMERZEL_")}
+                self.assertEqual(pinned, {
+                    "DEMERZEL_PROVIDER": smoke.INSTANCE,
+                    "DEMERZEL_MODEL": smoke.MODEL,
+                    "DEMERZEL_BASE_URL": MOCK_URL + "/v1",
+                })
+                self.assertNotIn("ANTHROPIC_API_KEY", env)
+                for name in ("HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"):
+                    self.assertNotIn(env[name], (os.environ.get(name), hostile["XDG_CONFIG_HOME"]), name)
+                # The judge config and its key reach a judged task only.
+                config = tomllib.loads(record["config"])
+                if judged:
+                    self.assertEqual(env[smoke.JUDGE_KEY_VARIABLE], smoke.JUDGE_KEY)
+                    self.assertEqual(config["judgments"], {"instance": smoke.JUDGE_INSTANCE})
+                    self.assertEqual(config["providers"][smoke.JUDGE_INSTANCE], {
+                        "kind": "typesafe",
+                        "base_url": MOCK_URL + "/judge",
+                        "model": JUDGE["model"],
+                        "api_key_env": smoke.JUDGE_KEY_VARIABLE,
+                    })
+                else:
+                    self.assertNotIn(smoke.JUDGE_KEY_VARIABLE, env)
+                    self.assertNotIn("judgments", config)
+                    self.assertEqual(set(config["providers"]), {smoke.INSTANCE})
 
     def test_names_select_a_subset(self):
         self.tasks = make_set(self.tmp / "two", names=("one", "two"))
@@ -475,6 +539,48 @@ class ValidationTests(SmokeTestCase):
         for label, replies in shapes.items():
             with self.subTest(shape=label):
                 write_json(self.tasks / "one" / "transcript.json", {"schema": 1, "replies": replies})
+                self.assert_invalid(self.tasks)
+
+    def test_judge_member_shapes(self):
+        score = {"type": "score", "score": 0.5, "confidence": 0.5,
+                 "probabilities": {"0": 0.5, "1": 0.5}, "legend": {"0": "low", "1": "high"}}
+        choice = {"type": "choice", "choice": "fix", "confidence": 0.5, "probabilities": {"fix": 1}}
+        valid = dict(JUDGE, requests=0, answers=dict(JUDGE["answers"], risk=score, kind=choice))
+        write_json(self.tasks / "one" / "transcript.json", dict(TRANSCRIPT, judge=valid))
+        self.assertEqual(self.check(self.tasks), 0)
+        noul = JUDGE["answers"]["outcome"]
+        shapes = {
+            "null": None,
+            "a list": [],
+            "unknown field": dict(JUDGE, extra=1),
+            "no model": {"requests": 1, "answers": JUDGE["answers"]},
+            "empty model": dict(JUDGE, model=""),
+            "negative requests": dict(JUDGE, requests=-1),
+            "fractional requests": dict(JUDGE, requests=1.5),
+            "boolean requests": dict(JUDGE, requests=True),
+            "answers a list": dict(JUDGE, answers=[noul]),
+            "no answers": dict(JUDGE, answers={}),
+            "answer not an object": dict(JUDGE, answers={"outcome": "yes"}),
+            "unknown answer type": dict(JUDGE, answers={"outcome": {"type": "yes_no", "yes": 0.5}}),
+            "unknown answer field": dict(JUDGE, answers={"outcome": dict(noul, extra=1)}),
+            "missing answer field": dict(JUDGE, answers={"risk": {k: v for k, v in score.items() if k != "legend"}}),
+            "answer not a number": dict(JUDGE, answers={"outcome": dict(noul, noul="0.5")}),
+            "score level gap": dict(JUDGE, answers={"risk": dict(score, probabilities={"0": 0.5, "2": 0.5})}),
+            "score legend short": dict(JUDGE, answers={"risk": dict(score, legend={"0": "low"})}),
+        }
+        for label, judge in shapes.items():
+            with self.subTest(shape=label):
+                write_json(self.tasks / "one" / "transcript.json", dict(TRANSCRIPT, judge=judge))
+                self.assert_invalid(self.tasks)
+        # The strict JSON rules hold inside the member too.
+        text = json.dumps(JUDGED_TRANSCRIPT)
+        for label, broken in (
+            ("duplicate key", text.replace('"requests": 2', '"requests": 2, "requests": 2')),
+            ("NaN", text.replace('"noul": 0.25', '"noul": NaN')),
+        ):
+            with self.subTest(case=label):
+                self.assertNotEqual(broken, text)
+                (self.tasks / "one" / "transcript.json").write_text(broken)
                 self.assert_invalid(self.tasks)
 
     def test_public_set_passes_check(self):

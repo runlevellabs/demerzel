@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "prompt": "Run test.sh. Set the mode in mode.txt to strict. Then run lint.sh. Append the output and the exit status of each run to test.out or lint.out.",
+  "oracle": [
+    "sh",
+    "-c",
+    "diff -r . \"$DEMERZEL_EVAL_TASK_DIR/expected\" && python3 -I \"$DEMERZEL_EVAL_TASK_DIR/judgments.py\""
+  ]
+}

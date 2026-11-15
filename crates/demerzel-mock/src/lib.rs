@@ -7,11 +7,21 @@
 //! `POST /oauth/token` for the credential-refresh and login-exchange
 //! paths. It records every request so tests can assert on
 //! serialization and headers. Never part of the shipped binary.
+//!
+//! The crate also builds the `demerzel-mock` binary, a test tool for
+//! the hermetic smoke runner. It serves the replies of a [`transcript`]
+//! file as Chat Completions streams from a server that answers only
+//! the Chat Completions route ([`MockServer::start_chat`]). It checks
+//! that each request after a tool-call reply carries the tool results,
+//! and it stops at end of file on stdin with a count of served and
+//! unused replies and of refused requests. It is not part of the
+//! shipped `demerzel` binary either.
 
 pub mod anthropic;
 pub mod codex;
 pub mod compat;
 pub mod responses;
+pub mod transcript;
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
@@ -57,8 +67,25 @@ impl SseEvent {
 
 /// A check on a request body. `Err` makes the mock refuse the request
 /// with status 400 and the message, the way a strict server refuses a
-/// request that lacks a field it requires.
-pub type BodyCheck = fn(&Value) -> Result<(), String>;
+/// request that lacks a field it requires. The check can hold data,
+/// such as the call ids a request must answer.
+#[derive(Clone)]
+pub struct BodyCheck(Arc<CheckFn>);
+
+type CheckFn = dyn Fn(&Value) -> Result<(), String> + Send + Sync;
+
+impl BodyCheck {
+    /// Run the check on a request body.
+    pub fn run(&self, body: &Value) -> Result<(), String> {
+        (self.0)(body)
+    }
+}
+
+impl std::fmt::Debug for BodyCheck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BodyCheck(..)")
+    }
+}
 
 /// One scripted reply for the model routes.
 #[derive(Debug, Clone)]
@@ -113,8 +140,11 @@ impl MockResponse {
     }
 
     /// This reply, behind a check on the request body.
-    pub fn with_check(mut self, check: BodyCheck) -> Self {
-        self.check = Some(check);
+    pub fn with_check(
+        mut self,
+        check: impl Fn(&Value) -> Result<(), String> + Send + Sync + 'static,
+    ) -> Self {
+        self.check = Some(BodyCheck(Arc::new(check)));
         self
     }
 
@@ -180,6 +210,16 @@ struct ServerState {
     /// Numbers the `x-request-id` header on every model-route reply,
     /// the way the live endpoints tag a response.
     replies: AtomicU64,
+    /// Model requests answered with an error and no scripted reply.
+    refused: AtomicU64,
+}
+
+/// The routes a server answers.
+enum Routes {
+    /// Every route.
+    All,
+    /// Only the Chat Completions route.
+    Chat,
 }
 
 /// A running mock server. Dropping the handle stops the server task.
@@ -192,7 +232,13 @@ pub struct MockServer {
 impl MockServer {
     /// Start the server on an ephemeral local port.
     pub async fn start(responses: Vec<MockResponse>, token_responses: Vec<Value>) -> Self {
-        Self::start_inner(responses, token_responses, false).await
+        Self::start_inner(responses, token_responses, false, Routes::All).await
+    }
+
+    /// Start the server with only `POST /v1/chat/completions`. Every
+    /// other path gets 404 and takes no reply from the script.
+    pub async fn start_chat(responses: Vec<MockResponse>) -> Self {
+        Self::start_inner(responses, Vec::new(), false, Routes::Chat).await
     }
 
     /// Start the server with a `/responses` script that cycles
@@ -201,13 +247,14 @@ impl MockServer {
     /// [`MockServer::received`] returns an empty list. The token
     /// route has no script, so a refresh attempt gets 410.
     pub async fn start_looping(responses: Vec<MockResponse>) -> Self {
-        Self::start_inner(responses, Vec::new(), true).await
+        Self::start_inner(responses, Vec::new(), true, Routes::All).await
     }
 
     async fn start_inner(
         responses: Vec<MockResponse>,
         token_responses: Vec<Value>,
         cycle: bool,
+        routes: Routes,
     ) -> Self {
         let state = Arc::new(ServerState {
             responses: Mutex::new(responses.into()),
@@ -215,15 +262,25 @@ impl MockServer {
             received: Mutex::new(Vec::new()),
             cycle,
             replies: AtomicU64::new(0),
+            refused: AtomicU64::new(0),
         });
-        let app = Router::new()
-            .route("/responses", post(handle_responses))
-            .route("/v1/responses", post(handle_api_responses))
-            .route("/v1/messages", post(handle_messages))
-            .route("/v1/chat/completions", post(handle_chat))
-            .route("/v1/models", get(handle_models))
-            .route("/oauth/token", post(handle_token))
-            .with_state(state.clone());
+        let app = match routes {
+            Routes::All => Router::new()
+                .route("/v1/chat/completions", post(handle_chat))
+                .route("/responses", post(handle_responses))
+                .route("/v1/responses", post(handle_api_responses))
+                .route("/v1/messages", post(handle_messages))
+                .route("/v1/models", get(handle_models))
+                .route("/oauth/token", post(handle_token)),
+            // Count every other path and method as a refused request.
+            Routes::Chat => Router::new()
+                .route(
+                    "/v1/chat/completions",
+                    post(handle_chat).fallback(refuse_method),
+                )
+                .fallback(refuse_path),
+        }
+        .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind mock server");
@@ -237,6 +294,21 @@ impl MockServer {
     /// Base URL of the running server, without a trailing slash.
     pub fn url(&self) -> String {
         format!("http://{}", self.addr)
+    }
+
+    /// The number of scripted replies sent so far. A request that a
+    /// body check refuses, or that finds the script empty, gets no
+    /// reply and does not count.
+    pub fn served(&self) -> u64 {
+        self.state.replies.load(Ordering::Relaxed)
+    }
+
+    /// The number of model requests answered with an error and no
+    /// scripted reply: a body check refused it, or the script was
+    /// empty. A server from [`MockServer::start_chat`] also counts each
+    /// request to another path or with another method.
+    pub fn refused(&self) -> u64 {
+        self.state.refused.load(Ordering::Relaxed)
     }
 
     /// All requests received so far, in order.
@@ -319,11 +391,11 @@ fn scripted_reply(state: &ServerState, path: &str, headers: &HeaderMap, body: St
     };
     // Parse the body only when something reads it: the record or a
     // check. A cycling benchmark does neither, so its floor holds.
-    let check = next.as_ref().and_then(|reply| reply.check);
+    let check = next.as_ref().and_then(|reply| reply.check.as_ref());
     let parsed = (!state.cycle || check.is_some())
         .then(|| serde_json::from_str::<Value>(&body).unwrap_or(Value::Null));
     let refusal = match (check, &parsed) {
-        (Some(check), Some(body)) => check(body).err(),
+        (Some(check), Some(body)) => check.run(body).err(),
         _ => None,
     };
     if !state.cycle
@@ -332,9 +404,11 @@ fn scripted_reply(state: &ServerState, path: &str, headers: &HeaderMap, body: St
         record(state, path, headers, body);
     }
     let Some(reply) = next else {
+        state.refused.fetch_add(1, Ordering::Relaxed);
         return (StatusCode::GONE, "mock script exhausted").into_response();
     };
     if let Some(message) = refusal {
+        state.refused.fetch_add(1, Ordering::Relaxed);
         return (
             StatusCode::BAD_REQUEST,
             json!({"error": {"message": message}}).to_string(),
@@ -392,6 +466,16 @@ fn scripted_reply(state: &ServerState, path: &str, headers: &HeaderMap, body: St
         .header("x-request-id", request_id)
         .body(body)
         .expect("build sse response")
+}
+
+async fn refuse_path(State(state): State<Arc<ServerState>>) -> Response {
+    state.refused.fetch_add(1, Ordering::Relaxed);
+    StatusCode::NOT_FOUND.into_response()
+}
+
+async fn refuse_method(State(state): State<Arc<ServerState>>) -> Response {
+    state.refused.fetch_add(1, Ordering::Relaxed);
+    StatusCode::METHOD_NOT_ALLOWED.into_response()
 }
 
 async fn handle_token(

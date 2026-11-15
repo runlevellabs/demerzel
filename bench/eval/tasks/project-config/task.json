@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "prompt": "Add note.txt with one line about this run.",
+  "oracle": [
+    "sh",
+    "-c",
+    "diff -r . \"$DEMERZEL_EVAL_TASK_DIR/expected\""
+  ]
+}

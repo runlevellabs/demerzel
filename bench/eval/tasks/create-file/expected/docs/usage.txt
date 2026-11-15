@@ -1,0 +1,2 @@
+Run the tool with no arguments.
+The tool prints one line.

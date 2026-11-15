@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "replies": [
+    {
+      "tool_calls": [
+        {
+          "id": "call_create",
+          "name": "create",
+          "input": {
+            "path": "note.txt",
+            "content": "The run reached the scripted model.\n"
+          }
+        }
+      ]
+    },
+    {
+      "text": "note.txt is in place."
+    }
+  ]
+}

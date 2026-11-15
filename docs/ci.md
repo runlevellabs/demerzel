@@ -11,13 +11,18 @@ It checks new advisories against the current lockfile.
 | --- | --- |
 | `test (ubuntu-latest)` | Formatting, Clippy, workspace tests, and benchmark probe tests |
 | `test (macos-latest)` | The same checks on macOS |
-| `gates` | Rustdoc, release build, release tests, and binary size on Linux |
+| `gates` | Rustdoc, release build, release tests, binary size, and smoke tasks on Linux |
 | `quality` | CI helper tests, workflow syntax, and local Markdown links and anchors |
 | `dependencies` | Dependency advisories, licenses, and sources |
 | `PR metadata` | Pull request title, commit subjects, and required body sections |
 
 The release tests use the full workspace suite with optimization enabled.
 The release binary must remain below 25,000,000 bytes.
+The smoke tasks run the release binary against a scripted model, with no network.
+The job summary records their output and durations, also after a failed task.
+A run that reaches the step timeout records no summary.
+A slow task fails only when it runs past the per-task timeout.
+See [the smoke runner](../bench/README.md#the-smoke-runner) for the tasks and their isolation.
 CI does not compare timing measurements from shared runners.
 Use the reference machines in [bench-platforms.md](bench-platforms.md) for performance claims.
 
@@ -140,6 +145,8 @@ actionlint
 git ls-files -z '*.md' | xargs -0 lychee --offline --include-fragments --no-progress --
 cargo deny --locked check advisories licenses sources
 cargo test --workspace --release --locked
+cargo build --release --locked
+python3 bench/eval/smoke.py
 ```
 
 The link command checks tracked files.

@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "prompt": "Make check.sh pass. Change only version.txt.",
+  "oracle": [
+    "sh",
+    "-c",
+    "diff -r . \"$DEMERZEL_EVAL_TASK_DIR/expected\""
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "prompt": "Set the value in first.txt and in second.txt to 2.",
+  "oracle": [
+    "sh",
+    "-c",
+    "diff -r . \"$DEMERZEL_EVAL_TASK_DIR/expected\""
+  ]
+}

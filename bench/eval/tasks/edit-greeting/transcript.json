@@ -1,0 +1,50 @@
+{
+  "schema": 1,
+  "replies": [
+    {
+      "tool_calls": [
+        {
+          "id": "call_read",
+          "name": "read",
+          "input": {
+            "path": "greet.sh"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "call_edit",
+          "name": "edit",
+          "input": {
+            "path": "greet.sh",
+            "tag": "0d492a",
+            "edits": [
+              {
+                "op": "replace",
+                "start": 2,
+                "end": 2,
+                "content": "echo \"Hello, smoke\""
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "call_run",
+          "name": "bash",
+          "input": {
+            "command": "./greet.sh >> greet.out 2>&1; echo \"exit $?\" >> greet.out"
+          }
+        }
+      ]
+    },
+    {
+      "text": "greet.sh now prints Hello, smoke. greet.out holds the output."
+    }
+  ]
+}

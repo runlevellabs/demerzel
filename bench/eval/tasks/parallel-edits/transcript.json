@@ -1,0 +1,62 @@
+{
+  "schema": 1,
+  "replies": [
+    {
+      "tool_calls": [
+        {
+          "id": "call_read_first",
+          "name": "read",
+          "input": {
+            "path": "first.txt"
+          }
+        },
+        {
+          "id": "call_read_second",
+          "name": "read",
+          "input": {
+            "path": "second.txt"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "call_edit_first",
+          "name": "edit",
+          "input": {
+            "path": "first.txt",
+            "tag": "cef7f8",
+            "edits": [
+              {
+                "op": "replace",
+                "start": 1,
+                "end": 1,
+                "content": "first = 2"
+              }
+            ]
+          }
+        },
+        {
+          "id": "call_edit_second",
+          "name": "edit",
+          "input": {
+            "path": "second.txt",
+            "tag": "4feda8",
+            "edits": [
+              {
+                "op": "replace",
+                "start": 1,
+                "end": 1,
+                "content": "second = 2"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "text": "Both files now hold the value 2."
+    }
+  ]
+}

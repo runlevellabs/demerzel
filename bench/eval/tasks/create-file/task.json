@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "prompt": "Add docs/usage.txt. It tells the user to run the tool with no arguments.",
+  "oracle": [
+    "sh",
+    "-c",
+    "diff -r . \"$DEMERZEL_EVAL_TASK_DIR/expected\""
+  ]
+}

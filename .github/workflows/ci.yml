@@ -90,6 +90,23 @@ jobs:
           size=$(wc -c < target/release/demerzel)
           echo "binary: ${size} bytes; gate: ${limit} bytes"
           test "$size" -lt "$limit"
+      # The hermetic smoke tasks. The summary logs their output and
+      # durations, also when a task fails.
+      - name: Run the smoke tasks
+        shell: bash
+        timeout-minutes: 10
+        run: |
+          set +e
+          python3 bench/eval/smoke.py 2>&1 | tee "$RUNNER_TEMP/smoke.txt"
+          status=${PIPESTATUS[0]}
+          set -e
+          {
+            echo '### Smoke tasks'
+            echo
+            # An indented block holds any output; a fence can break.
+            sed 's/^/    /' "$RUNNER_TEMP/smoke.txt"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
 
   quality:
     if: ${{ github.event_name != 'schedule' }}

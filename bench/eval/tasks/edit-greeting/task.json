@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "prompt": "Change the greeting in greet.sh to Hello, smoke. Then run the script and keep its output in greet.out.",
+  "oracle": [
+    "sh",
+    "-c",
+    "test -x greet.sh && diff -r . \"$DEMERZEL_EVAL_TASK_DIR/expected\""
+  ]
+}

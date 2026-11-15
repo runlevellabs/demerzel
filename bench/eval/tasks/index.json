@@ -1,0 +1,30 @@
+{
+  "schema": 1,
+  "tasks": [
+    {
+      "name": "edit-greeting",
+      "source_step": "synthetic",
+      "summary": "Edit an executable script, then run it with bash and record the output."
+    },
+    {
+      "name": "create-file",
+      "source_step": "synthetic",
+      "summary": "Create a file in a new directory; a second create of the same path leaves the file unchanged."
+    },
+    {
+      "name": "parallel-edits",
+      "source_step": "synthetic",
+      "summary": "Read two files and edit both, with two parallel tool calls in each reply."
+    },
+    {
+      "name": "recover-from-failures",
+      "source_step": "synthetic",
+      "summary": "Recover from a failed bash check and an edit with a stale tag."
+    },
+    {
+      "name": "project-config",
+      "source_step": "synthetic",
+      "summary": "A project config file that names another provider and endpoint cannot move the run off the mock."
+    }
+  ]
+}

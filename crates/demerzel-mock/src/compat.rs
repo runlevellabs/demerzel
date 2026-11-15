@@ -75,10 +75,10 @@ pub fn text_turn(text: &str) -> MockResponse {
 
 /// The fragments of one tool call at wire index `index`: the first
 /// carries the id, the type, and the name; the arguments follow in
-/// two pieces.
+/// two pieces, split on a character boundary.
 pub fn tool_call_fragments(index: u64, id: &str, name: &str, input: &Value) -> Vec<Value> {
     let arguments = input.to_string();
-    let (head, tail) = arguments.split_at(arguments.len() / 2);
+    let (head, tail) = arguments.split_at(arguments.floor_char_boundary(arguments.len() / 2));
     vec![
         chunk(json!({"tool_calls": [{
             "index": index,
@@ -93,8 +93,16 @@ pub fn tool_call_fragments(index: u64, id: &str, name: &str, input: &Value) -> V
 
 /// A reply that streams one tool call in fragments.
 pub fn tool_turn(id: &str, name: &str, input: Value) -> MockResponse {
+    tool_calls_turn(&[(id, name, &input)])
+}
+
+/// A reply that streams parallel tool calls in one assistant message,
+/// each `(id, name, input)` in fragments at wire index 0, 1, and so on.
+pub fn tool_calls_turn(calls: &[(&str, &str, &Value)]) -> MockResponse {
     let mut chunks = vec![chunk(json!({"role": "assistant", "content": null}))];
-    chunks.extend(tool_call_fragments(0, id, name, &input));
+    for (index, (id, name, input)) in (0u64..).zip(calls) {
+        chunks.extend(tool_call_fragments(index, id, name, input));
+    }
     chunks.push(finish("tool_calls"));
     closed(chunks)
 }

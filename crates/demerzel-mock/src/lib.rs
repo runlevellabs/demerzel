@@ -441,7 +441,7 @@ async fn handle_prefixed_systemone(
 ) -> Response {
     match judge_reply(&state, "/judge/v1/systemone", &headers, &body) {
         Some(response) => response,
-        None => refuse_path(State(state)).await,
+        None => refuse(&state, StatusCode::NOT_FOUND),
     }
 }
 
@@ -574,14 +574,21 @@ fn scripted_reply(state: &ServerState, path: &str, headers: &HeaderMap, body: St
         .expect("build sse response")
 }
 
-async fn refuse_path(State(state): State<Arc<ServerState>>) -> Response {
+/// Count one refused request and answer with `status`.
+fn refuse(state: &ServerState, status: StatusCode) -> Response {
     state.refused.fetch_add(1, Ordering::Relaxed);
-    StatusCode::NOT_FOUND.into_response()
+    status.into_response()
 }
 
-async fn refuse_method(State(state): State<Arc<ServerState>>) -> Response {
-    state.refused.fetch_add(1, Ordering::Relaxed);
-    StatusCode::METHOD_NOT_ALLOWED.into_response()
+// The two fallbacks read the request body before they answer. A server
+// that closes a connection with unread request bytes resets it, and
+// the client can then lose the reply.
+async fn refuse_path(State(state): State<Arc<ServerState>>, _body: Bytes) -> Response {
+    refuse(&state, StatusCode::NOT_FOUND)
+}
+
+async fn refuse_method(State(state): State<Arc<ServerState>>, _body: Bytes) -> Response {
+    refuse(&state, StatusCode::METHOD_NOT_ALLOWED)
 }
 
 async fn handle_token(

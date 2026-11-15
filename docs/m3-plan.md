@@ -9,20 +9,21 @@ ordered, verifiable steps. It follows the shape of
 
 ## Next-session handoff
 
-**Checked 2026-11-12:** M0 through M2.5 are complete, with both close-outs.
-M3 steps 1 to 7 are on `main`: this plan, `openai-compat` with named
+**Checked 2026-11-15:** M0 through M2.5 are complete, with both close-outs.
+M3 steps 1 to 8 are on `main`: this plan, `openai-compat` with named
 instances (`f4b7900`), `openai-responses` (`d9e51e8`), instance
 login with the thinking key (`3e6a935`), one runtime call with
 model identity (`424c31b`), roles with fallback chains
-(`88cb35e`), and prompt composition with instruction files
-(`404e39a`). Two receipts are pending. Step 3's hosted receipt needs
+(`88cb35e`), prompt composition with instruction files
+(`404e39a`), and the hermetic smoke runner (`ca7abff`). Two receipts
+are pending. Step 3's hosted receipt needs
 an OpenAI or xAI API key. Step 7's cache-hit replay needs a hosted
 login: on 2026-11-12 the stored Anthropic key and the ChatGPT login
 both failed. See each step's build notes.
 
 Start the next work in this order:
 
-1. Build the hermetic smoke runner as step 8.
+1. Build the judge contract and the logged checks as step 8a.
 2. Record the step 7 cache-hit replay when a hosted login works. The
    step's build notes name the run.
 3. Record the step 3 hosted receipt when a key is available. The step's
@@ -35,6 +36,12 @@ Start the next work in this order:
 A release build can link stale code from a benchmark worktree that
 shared the target directory. Give each benchmark side its own
 `CARGO_TARGET_DIR`; see the step 7 build notes.
+
+Run `python3 bench/eval/smoke.py` after a release build when a change
+can alter the harness loop, a tool, or the config rules. The command
+is in [Local verification](ci.md#local-verification). A release build
+at the workspace root gives a larger `demerzel` binary than
+`cargo build --release -p demerzel`; see the step 8 build notes.
 
 The Linux reference machine runs a local Ollama server. It serves both
 protocols at `http://127.0.0.1:11434/v1` for dogfood. Its default
@@ -59,7 +66,7 @@ A step's block holds the notes that earlier steps left for it, under
 The [tracked items](#tracked-separately) are not prerequisites for any
 step. Do not fold them into a step without a decision in this document.
 
-## Status (2026-11-12)
+## Status (2026-11-15)
 
 | Step | State |
 |---|---|
@@ -70,8 +77,9 @@ step. Do not fold them into a step without a decision in this document.
 | 5. One runtime call and model identity | Done on 2026-11-08, with a local dogfood receipt |
 | 6. Roles and fallback chains | Done on 2026-11-08: `88cb35e`, with a local dogfood receipt |
 | 7. Prompt composition and instruction files | Built on 2026-11-12: `404e39a`, with a local dogfood receipt. The cache-hit replay is pending. |
-| 8. The hermetic smoke runner | Next |
-| 8a to 19 | Not started |
+| 8. The hermetic smoke runner | Done on 2026-11-15: `ca7abff`, with a [CI run](https://github.com/runlevellabs/demerzel/actions/runs/43731193857) |
+| 8a. The judge contract and logged checks | Next |
+| 8b to 19 | Not started |
 
 The M2.5 close-out
 ([`m2.5-closeout.md`](m2.5-closeout.md)) recorded the receipts on both
@@ -1343,7 +1351,7 @@ contract.
 | Provider trait | The methods are unchanged: `id`, `capabilities`, `stream`. Step 19 removes each `Capabilities` field without a consumer; the struct stays. That is a breaking change to a public type in the provider contract. Step 8a adds the `Judge` trait beside it, with `id` and `ask`. The judge is a second model contract; step 8a adds it to the `AGENTS.md` contract list. |
 | Engine events | `ModelStart { provider, model, attempt }` (step 6); `Judgment { call_id, source, action, text }` (8b); `AgentStart { id, name }` and `AgentEnd { id }` (step 17). |
 | Tool names and schemas | `bash` gains `background` (step 9); new tools `task_output`, `task_stop` (9), `skill` (10), `memory_save`, `memory_search`, `memory_forget` (13), `profile_propose` (14), `search_tools` and `<server>__<tool>` (16), `agent` and `submit_result` (17). |
-| Config keys | `providers.<name>.kind`, `.api_key_env`, and instance names as `provider` values (2); `kind = "openai-responses"` as a new value (3); `.thinking` (4); `[roles.<name>] chain` (6); `[prompt] base_file` (7); `kind = "typesafe"` as a new value, `[judgments] instance`, `checks` with `off` and `log`, `max_calls` (8a); the `warn`, `note`, and `act` actions and `[[judgments.rules]] event`, `tool`, `ask`, `threshold`, `action`, `reason` (8b); `openai-compat` instances as `judgments.instance` (8c); `discovery` (12); `[memory] enabled`, `recall_tokens` (13); `[[hooks]] event`, `tool`, `run`, `timeout_seconds` (15); `[mcp.<name>] command`, `args`, `env`, `always` (16); `[subagents] max_model_calls`, `timeout_seconds` (17). The environment gains `DEMERZEL_EVAL_BANK` (8), a variable and not a key, like `DEMERZEL_LOG`. |
+| Config keys | `providers.<name>.kind`, `.api_key_env`, and instance names as `provider` values (2); `kind = "openai-responses"` as a new value (3); `.thinking` (4); `[roles.<name>] chain` (6); `[prompt] base_file` (7); `kind = "typesafe"` as a new value, `[judgments] instance`, `checks` with `off` and `log`, `max_calls` (8a); the `warn`, `note`, and `act` actions and `[[judgments.rules]] event`, `tool`, `ask`, `threshold`, `action`, `reason` (8b); `openai-compat` instances as `judgments.instance` (8c); `discovery` (12); `[memory] enabled`, `recall_tokens` (13); `[[hooks]] event`, `tool`, `run`, `timeout_seconds` (15); `[mcp.<name>] command`, `args`, `env`, `always` (16); `[subagents] max_model_calls`, `timeout_seconds` (17). The smoke runner reads `DEMERZEL_EVAL_BANK` (8). The binary does not read it, so it is not a key and not a variable of the binary. |
 | Session file | `meta.provider` redefined as the instance name, `meta.kind`, and optional `SealedPayload.model` and `.instance` added; `SealedPayload` becomes non-exhaustive (2); shipped adapters populate payload identity (5); `usage.provider`, `usage.model` (6); the `judgment` record (8a); the `answer` value `judge` (8b); the `recall` record (13); the `hook` record and the `answer` value `hook` (15); `meta.parent` and the `agent_child` record (17); `meta.prompt_hash`, `meta.tools_hash`, and the `tool_set` record (18). The schema version stays 1. |
 | CLI | `--provider` and `DEMERZEL_PROVIDER` take instance names (2); `login <instance>` for both compatible adapters (4); `/model <provider> <model>` (6); `login <instance>` for a `typesafe` instance (8a); `/judgments` (8b); `/skill` (10); custom commands (11); `/tasks` (9); `/remember`, `/memory` (13); `/profile` (14); `trust` subcommand (15); `/mcp` (16); `-c` excludes children and `--session` refuses a child id (17). |
 
@@ -2021,13 +2029,114 @@ for judgments. Letters keep the later step numbers stable.
   directory with an `AGENTS.md` sends that file.
 - **Crates:** `demerzel-mock` (the binary). The rest is Python.
 - **Contracts:** provider trait none; engine events none; tools none;
-  config none, with the `DEMERZEL_EVAL_BANK` variable; session none;
-  CLI none.
+  config none; session none; CLI none. Only the runner reads the
+  `DEMERZEL_EVAL_BANK` variable.
 - **Compatibility:** none; the runner is outside the binary.
 - **Verify:** the smoke subset passes in CI on the release build; a
   task with a broken oracle fails the run; the bank index validates.
 - **Done when:** the smoke part of exit criterion 9 holds.
 - **Measure:** the smoke subset's CI duration is logged, not gated.
+- **Build notes (2026-11-15, `ca7abff`):**
+  - The mock binary is `demerzel-mock <transcript.json>`, in
+    `crates/demerzel-mock`. It prints its base URL as the first line
+    on stdout. It serves each reply once, in request order, as a Chat
+    Completions stream. It stops when its standard input reaches end
+    of file, and then prints `{"served":n,"unused":m,"refused":k}`.
+    A mock cannot stay alive after its runner.
+  - Only `POST /v1/chat/completions` takes a reply. A request after
+    the last reply gets 410. Each other path gets 404 or 405. After a
+    tool-call reply, the next request must hold one tool message for
+    each scripted call id, or it gets 400. The count line includes
+    each refusal.
+  - The transcript does not name a protocol:
+    `{"schema": 1, "replies": [...]}`, where a reply holds `text` or
+    `tool_calls` with `id`, `name`, and `input`. A task transcript is
+    tool-call replies, then one text reply, which is last.
+  - A run passes when the agent exits with 0, the mock reports that it
+    served each reply and refused no request, and the oracle exits
+    with 0. The exit status alone is not the proof.
+  - One layout serves the public set and the bank: `index.json`, and
+    for each task `task.json`, `transcript.json`, and `repo/`. The
+    public tasks also hold `expected/`, which each oracle compares
+    with the final tree. [`bench/README.md`](../bench/README.md#the-smoke-runner)
+    states the formats.
+  - `task.json` holds `schema`, `prompt`, and `oracle`. It is the
+    scenario document. Step 18 adds its fields there.
+  - Format rule: schema 1 grows by optional fields. A reader refuses
+    a field that it does not know. The number changes only when a
+    field changes meaning or becomes required. The runner's validator
+    owns the three formats; the mock's parser only maps replies to the
+    wire.
+  - `source_step` is `synthetic`, or a milestone and a step, such as
+    `m3-7` or `m2.5-8f`. The close-out reads these values for exit
+    criterion 9.
+  - The oracle is an argument list. It runs in the final state with
+    `DEMERZEL_EVAL_TASK_DIR`, which names the task directory. The
+    agent does not get that variable.
+  - Only `--bank` reads `DEMERZEL_EVAL_BANK`. The public set stays the
+    default when the variable is set, because a bank task can fail
+    until its fix lands.
+  - Isolation: each run gets a scratch `HOME` and scratch XDG
+    directories. The child environment keeps `PATH`, `LANG`, `LC_ALL`,
+    `LC_CTYPE`, and `TMPDIR` only. The runner sets `DEMERZEL_PROVIDER`,
+    `DEMERZEL_MODEL`, and `DEMERZEL_BASE_URL`, so a project config file
+    in a fixture cannot move the route. The `project-config` task
+    checks this rule.
+  - The five public tasks: `edit-greeting`, `create-file`,
+    `parallel-edits`, `recover-from-failures`, and `project-config`.
+    Each scripted `bash` call appends its output and its exit status
+    to a file in the tree. A broken tool changes the final state.
+  - Limits: the run does not check the content of a `read` result. A
+    failed `read` and a `read` through an unknown tool name both pass.
+    A call that must fail shows only that it changed nothing. The mock
+    does not check the tool calls that the harness sends back.
+  - A project role in a fixture can add fallback targets on shipped
+    adapters. A fallback runs only after a failed model call, and the
+    scratch directories hold no credentials, so the task fails. A
+    loopback-only network namespace showed no network use.
+  - Process control: each child runs in its own session. A stop blocks
+    SIGINT, SIGTERM, and SIGHUP, signals the group, sends SIGKILL after
+    3 s, and then kills the rest of the group. The time limits are 30 s
+    for the agent, 30 s for the oracle, and 10 s for the mock start.
+  - CI: the `gates` job runs the smoke step after the size check, with
+    a 10-minute limit. The step writes the runner's output to the job
+    summary, also after a failed task.
+  - CI evidence: [run 43731193857](https://github.com/runlevellabs/demerzel/actions/runs/43731193857)
+    on `ca7abff`. The `gates` job passed, and its smoke step passed
+    five of five tasks in 0.07 s. The `quality` job passed, which
+    includes `actionlint` and the link check. Both `test` jobs passed,
+    so the runner tests pass on macOS. The `dependencies` job failed
+    on RUSTSEC-2026-0486 in `rustix` 1.1.4. That failure is older than
+    this step: the runs on `404e39a` and `f8d8bab` show it too.
+  - Review: three lenses and one verification pass. Material and
+    fixed: the run checked only the final tree, the exit status was
+    the only proof that the run used each reply, and the formats had
+    no growth rule. The verification pass confirmed seven of eight fix
+    groups. It found three more inputs that `--check` accepted and the
+    mock refused, and it found that the count left out refused
+    requests. All are fixed. That last round had no review pass.
+  - Measure: the five tasks run in 0.07 s. The runner adds 6.8 ms to
+    each task. The mock prints its URL 0.9 ms after its start and
+    holds 3.3 MiB. `demerzel-mock` is 1,340,296 bytes.
+  - Binary size: a release build at the workspace root gives a
+    `demerzel` binary of 9,036,264 bytes. `cargo build --release -p
+    demerzel` gives 8,958,392 bytes. Cargo joins the features of each
+    selected package, and the mock crate's server features reach the
+    shared dependencies. The CI size gate measures the larger binary.
+    This step did not change either size.
+  - No turn benchmark ran. No part of this step is in the `demerzel`
+    binary, and the bench fixtures did not change.
+  - Not run: the smoke tasks with the real binaries on macOS. CI ran
+    the runner tests there. Python before 3.13 has no `os.waitid` on
+    macOS, so the last group kill runs after the reap. The tests pass
+    with that path forced.
+  - Process: Opus 5.5 workers built this step under a coordinator
+    session. One worker built the mock binary, one built the runner,
+    and four reviewers ran read-only. Each worker took two fix rounds.
+  - Crate API in `demerzel-mock`: the `transcript` module;
+    `compat::tool_calls_turn`; `MockServer::start_chat`, `served`, and
+    `refused`. `BodyCheck` is now a struct, and
+    `MockResponse::with_check` takes a closure.
 
 ### 8a. The judge contract and logged checks
 
@@ -2044,6 +2153,14 @@ for judgments. Letters keep the later step numbers stable.
   contract list; the trust lines and the [`config.md`](config.md) update.
 - **Depends on:** steps 4 (instance login), 5 (`EngineParts` and
   `ProviderHost`), and 8 (the smoke runner).
+- **From step 8:** the mock binary serves one ordered reply list on
+  one route. A judge answer keyed by question id does not fit that
+  list. Decide between one mock process for each instance and keyed
+  members in the transcript. The runner writes a fixed user config
+  file, so a task with a judge needs an optional config overlay in
+  its directory. A new field in `task.json` or in the transcript is
+  optional and keeps schema 1. Each request that the mock refuses
+  fails the task, so a judge call must have a scripted answer.
 - **Crates:** `demerzel-core`, `demerzel-providers`, `demerzel`,
   `demerzel-mock`.
 - **Contracts:** provider trait none, and the new `Judge` trait beside
@@ -2137,6 +2254,9 @@ for judgments. Letters keep the later step numbers stable.
   notice for a server without log probabilities; the mock fixtures; the
   calibration report.
 - **Depends on:** steps 2 and 8b (the labeled set and the risky set).
+- **From step 8:** a compatible judge shares `/v1/chat/completions`
+  with the model, with up to 8 requests in flight. One ordered reply
+  list cannot serve both. Use the step 8a decision.
 - **Crates:** `demerzel-providers`, `demerzel`, `demerzel-mock`.
 - **Contracts:** provider trait none; engine events none; tools none;
   config `judgments.instance` accepts an `openai-compat` instance;
@@ -2400,6 +2520,10 @@ for judgments. Letters keep the later step numbers stable.
   `meta.parent` and `agent_child`; latest-session filtering and child-resume refusal;
   the agent card; the `config.md` update.
 - **Depends on:** steps 6 and 12.
+- **From step 8:** a smoke transcript ends with its one text reply. A
+  child session that ends in text breaks that rule. The mock's count
+  already proves that the run used each reply, so the rule can relax
+  without a schema change.
 - **From step 6:** `config::chains` returns every role's targets; the
   runtime keeps only the default role's tail today. Carry the other
   roles on `RunConfig` here. Every instance a role can name already
@@ -2444,6 +2568,27 @@ for judgments. Letters keep the later step numbers stable.
   writes the session's `meta` record, so the record can carry
   `prompt_hash`. The engine keeps the text in
   `EngineConfig.system_prompt`.
+- **From step 8:**
+  - `task.json` is the scenario. Add the base image, the seed, the
+    allowed tools, the policy assertions, the slice labels, and the
+    fault profile as optional fields. Do not add a second document.
+  - The runner deletes the scratch directory, and the session file
+    with it. A bundle needs an option that keeps the data directory.
+  - The fixture copy is not a git repository. A final-state `git diff`
+    needs one, and a `.git` directory in the copy breaks each
+    `diff -r . expected` oracle. Keep the git directory outside the
+    copy, or exclude it in the oracles.
+  - The smoke run does not check `read` results. The bundle's typed
+    trace can.
+  - Model-route faults fit in transcript replies, because the mock
+    library already scripts a status, a retry delay, and a stall. Keep
+    the scenario's fault profile for the environment.
+  - The index has no mark for a bank task that is known to fail, so
+    `--bank` exits with 1 until each fix lands. A task has no time
+    limit of its own. A transcript holds edit tags, which ties bank
+    data to the tag algorithm.
+  - The Harbor verifier has no `DEMERZEL_EVAL_TASK_DIR` and no
+    `expected/` directory. The adapter needs a conversion.
 - **Crates:** `demerzel-core` (hashes and tool-set records). The rest is Python.
 - **Contracts:** provider trait none; engine events none; tools none;
   config none; session `meta.prompt_hash`, `meta.tools_hash`, `tool_set`;
@@ -2629,8 +2774,10 @@ step:
 - The two M4 follow-ups: bounded layout retention and bulk card
   expansion, after the public benchmark baseline.
 - Mac system-cold timing, deferred by decision.
-- The open Dependabot pull requests, #23 to #28. CI cannot pass while
-  the Actions budget is out. The `base64` 0.23 and `criterion` 0.8
+- The `dependencies` CI job fails on RUSTSEC-2026-0486 until `rustix`
+  is 1.1.6 or newer. `cargo update -p rustix` is the fix. CI ran again
+  on 2026-11-15.
+- The open Dependabot pull requests, #23 to #28. The `base64` 0.23 and `criterion` 0.8
   bumps can need code changes. Each one needs a completed body before
   merge; see [`ci.md`](ci.md).
 - The body builders of the `anthropic`, `openai-compat`, and
@@ -2645,6 +2792,17 @@ step:
 - `prompt.base_file` has no size limit, because a replaced base prompt
   goes out as it is. The step 7 performance review asked for a refusal
   above 1 MiB.
+- A release build at the workspace root links a `demerzel` binary
+  77,872 bytes larger than `cargo build --release -p demerzel`,
+  because Cargo joins the features of the mock crate into the shared
+  dependencies. The CI size gate and `bench/README.md` use the root
+  build. Step 8 found it. Decide which build the size receipts name.
+- The mock binary keeps each request body in memory, and no code reads
+  them: about 1.7 times the request bytes. `Popen.wait` polls, which
+  adds up to 50 ms to a logged smoke duration. A smoke run cannot turn
+  on the debug trace, because the runner removes `DEMERZEL_LOG`. A
+  runner that SIGKILL stops leaves the agent alive until its next
+  model call fails. The step 8 reviews found these.
 - The HTTP clients set no connect timeout. A host that drops packets
   holds each fallback attempt for the system's TCP timeout before the
   chain moves on. When every target of a chain fails, the user sees

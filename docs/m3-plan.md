@@ -10,20 +10,23 @@ ordered, verifiable steps. It follows the shape of
 ## Next-session handoff
 
 **Checked 2026-11-15:** M0 through M2.5 are complete, with both close-outs.
-M3 steps 1 to 8 are on `main`: this plan, `openai-compat` with named
+M3 steps 1 to 8a are on `main`: this plan, `openai-compat` with named
 instances (`f4b7900`), `openai-responses` (`d9e51e8`), instance
 login with the thinking key (`3e6a935`), one runtime call with
 model identity (`424c31b`), roles with fallback chains
 (`88cb35e`), prompt composition with instruction files
-(`404e39a`), and the hermetic smoke runner (`ca7abff`). Two receipts
-are pending. Step 3's hosted receipt needs
+(`404e39a`), the hermetic smoke runner (`ca7abff`), and the judge
+contract with the logged checks (`0d7552e`). Two receipts and the
+step 8a dogfood are pending. Step 3's hosted receipt needs
 an OpenAI or xAI API key. Step 7's cache-hit replay needs a hosted
 login: on 2026-11-12 the stored Anthropic key and the ChatGPT login
 both failed. See each step's build notes.
 
 Start the next work in this order:
 
-1. Build the judge contract and the logged checks as step 8a.
+1. Build the judgment actions and rules as step 8b. Its gate needs
+   the step 8a dogfood records, and those need a key for the judge
+   service. Ask the owner for the key first.
 2. Record the step 7 cache-hit replay when a hosted login works. The
    step's build notes name the run.
 3. Record the step 3 hosted receipt when a key is available. The step's
@@ -78,8 +81,9 @@ step. Do not fold them into a step without a decision in this document.
 | 6. Roles and fallback chains | Done on 2026-11-08: `88cb35e`, with a local dogfood receipt |
 | 7. Prompt composition and instruction files | Built on 2026-11-12: `404e39a`, with a local dogfood receipt. The cache-hit replay is pending. |
 | 8. The hermetic smoke runner | Done on 2026-11-15: `ca7abff`, with a [CI run](https://github.com/runlevellabs/demerzel/actions/runs/43731193857) |
-| 8a. The judge contract and logged checks | Next |
-| 8b to 19 | Not started |
+| 8a. The judge contract and logged checks | Built on 2026-11-15: `0d7552e`, with the fixes `f476128` and `f1acccc` and a [CI run](https://github.com/runlevellabs/demerzel/actions/runs/43758283892). The dogfood records and the latency measure are pending. |
+| 8b. Judgment actions and rules | Next |
+| 8c to 19 | Not started |
 
 The M2.5 close-out
 ([`m2.5-closeout.md`](m2.5-closeout.md)) recorded the receipts on both
@@ -591,7 +595,9 @@ event sends at most one request: every question at that event goes into
 it. Question ids stay in code. The question text carries the full
 meaning.
 
-`ProviderHost` builds judges in its lazy instance slots. A `typesafe`
+The binary builds the judge at the first check, in one slot for the
+run; step 8a moved this out of `ProviderHost`, because the engine
+never calls a judge. A `typesafe`
 instance serves only as a judge. An `openai-compat` instance can serve
 as a provider and as a judge. A role that names a `typesafe` instance
 stops the run at boot. A judge setting that names an instance of another
@@ -606,7 +612,8 @@ kind also stops the run at boot.
   `base_url` is `https://api.typesafe.ai`. The default model is the
   alias `jev-latest`. An alias can move to a new version, so a tuned
   config pins a version id. The reply's `model` field names the version
-  that answered. `doctor` notes an alias when a check acts above `log`.
+  that answered. `doctor` always notes an alias; step 8b makes the note a warning when
+  a check acts above `log`.
   Retries back off on 429, 529, 5xx, and network errors, and honor
   `retry-after`. 401 and 422 fail fast. Every retry stays inside the
   request timeout. `dmz login <instance>` checks a key with
@@ -630,6 +637,9 @@ The `anthropic`, `openai-codex`, and `openai-responses` kinds cannot
 serve as judges: their protocols return no log probabilities.
 
 #### Configuration
+
+This sample shows the step 8b values. The step 8a build accepts only
+`off` and `log`, and it refuses `judgments.rules` in the user file.
 
 ```toml
 [providers.judge]
@@ -786,7 +796,8 @@ call. The state hash shows when the state builder changed.
 
 A judge receives tool input and output, as the main model does. The
 egress rule in [`plan.md`](plan.md#non-goals) names the judge instance.
-Only the user file, flags, and the environment can turn judgments on.
+Only the user file can turn judgments on. Step 8a added no flag and
+no variable for it.
 `doctor` names the judge instance, each check's action, and each rule
 with its source. A project rule sends state to the user's judge and
 counts against the user's cap. A project rule cannot approve a call. A
@@ -2199,6 +2210,117 @@ for judgments. Letters keep the later step numbers stable.
   reference machines. The turn bench gains `turn_text_judged`, with a
   mock judge at `log`; it stays within noise of `turn_text_compat`.
   Boot and idle stay unchanged.
+- **Build notes (2026-11-15, `0d7552e`):**
+  - Core: `judge.rs` holds the `Judge` trait and its types. `host.rs`
+    holds `LoopHost`, the four event structs, `TurnView`, and
+    `constrain`. `TurnEnd.outcome` is the enum `TurnEndOutcome`. The
+    event structs have no public constructor, and `constrain` is
+    private to the crate.
+  - The engine calls `tool_before` after the policy decides and before
+    the approver. It calls `tool_after` only for a call that ran, and
+    `turn_end` after the turn record, also for a provider error.
+  - The session file sits behind a lock, and `SessionWriter` appends a
+    `judgment` line from a task. A write counts its bytes; after an
+    error it cuts the file back, and a failed cut stops later appends.
+    Replay skips a `judgment` line that it cannot parse.
+  - Runtime: `judgments.rs` in the binary crate holds the host, the
+    filters, the state builder, the call cap, and the record task. One
+    judge slot serves the run. Each event spawns one task. The order
+    in a task is: build the judge, get a slot, take the budget, send.
+  - Deviation: at most 8 requests are in flight for one run. A check
+    without a slot inside the timeout writes a record with `error`
+    `busy` and sends nothing. The review found that 150 parallel calls
+    with a stalled judge used up the file descriptors.
+  - Deviation: the state adds the input of the earlier failed call for
+    `progress`, and the output tail of the turn's last call for
+    `claim`. Both stay inside the caps.
+  - Deviation: `progress` counts only an earlier call of the same tool
+    that ran and failed. A refused call does not count.
+  - `max_calls` counts the requests that went out for one opened
+    session. The cap notice comes at the first check that the cap
+    stops. A judge that cannot build takes none of the cap, gives one
+    notice for the session, and is tried once in each turn.
+  - Record: `at` is the send time and `duration_ms` the round trip.
+    The record has no `rules` field and no field for the action that
+    fired; step 8b adds both. `checks` holds the configured action.
+  - Pairing limit: a `tool_before` record pairs with the `approval`
+    record of the same call id. A server that reuses call ids in one
+    session makes those pairs ambiguous. The compatible adapters make
+    up `call_<index>` when a server sends no id.
+  - Exit: each interface waits for the requests in flight, for two
+    timeouts and 250 ms at most. It prints one line after 100 ms, and
+    Ctrl-C ends the wait. A one-shot run with a tool call ends with
+    the `claim` request in flight, so its exit waits for that answer.
+  - Config: check values parse as text and resolve with their source.
+    In the user file, another value than `off` or `log` stops the run,
+    and so does `judgments.rules`. A project file gets a warning.
+  - Trust fixes from the reviews: the project file's provider table
+    for the judge instance is ignored; the endpoint flag and
+    `DEMERZEL_BASE_URL` never apply to a judge; a top-level `model`
+    never becomes the judge's model.
+  - A role that names a judge-only instance stops the run, also for a
+    project role, because `config::chains` treats each refused target
+    that way.
+  - `typesafe` is an adapter id now. A `[providers.typesafe]` table
+    with another kind stops the run.
+  - Login: `Method::Instance` carries the kind, the adapter owns the
+    check route, and `KeyCheck` is one type for each adapter.
+  - Mock: the library serves the judge on `/v1/systemone` and, for the
+    binary, on `/judge/v1/systemone`. The transcript's optional
+    `judge` member holds the model, the expected request count, and
+    the answers by question id. The count line gains `judged`. The
+    runner writes the judge instance itself, so a task cannot add
+    user-file keys.
+  - Wire check against the API reference on 2026-11-15, drift from
+    this plan's text:
+    - `Choice` options travel in `criteria`, an object with 1 to 255
+      entries. The harness keeps its minimum of 2. The answer also
+      holds `confidence`.
+    - `Score` levels travel in `criteria`, a list of 1 to 10. The
+      answer also holds `confidence` and `legend`.
+    - The statuses 400, 413, and 415 exist beside 401 and 422. The
+      backend fails at once on each status that is not 429 or 5xx.
+    - The reference does not give the `retry-after` format. The
+      backend reads seconds.
+    - `jev-latest` points to `jev-1.14.0`. A second alias,
+      `jev-preview`, exists. The reply's `model` can repeat the alias.
+    - `GET /v1/models` lists the aliases only, so a key check cannot
+      confirm a pinned model id.
+    - A fourth question type for images exists. This step does not use
+      it.
+  - Review: a design pass, three lenses, and one verification pass.
+    Material and fixed: the unbounded requests in flight, the silent
+    exit wait with its Ctrl-C defect, a `judgment` record that stopped
+    a resume, and `judgments.rules` ignored in the user file. The
+    correctness lens found no material defect. The verification pass
+    found that the first 100 ms of the exit wait ignored Ctrl-C.
+  - The publication check found that the `judged-run` task wrote its
+    evidence to `*.log` files, which `.gitignore` excludes. The files
+    are `*.out` now.
+  - Measure, on a loaded machine: `turn_text_judged` is within -1.3%
+    to +1.3% of `turn_text_compat` in one build. Text turns without
+    judgments are within -1.2% to +3.9% of `main`. A first run showed
+    +4.5%, from a length read before each session write; the write
+    now reads the length only after an error. Boot and idle memory
+    are equal with and without a configured judge.
+  - Binary size: 9,401,448 bytes from a workspace-root build, 4.0%
+    above step 8.
+  - Pending: the dogfood records (at least 200 asks with both
+    answers) and the judge latency on both reference machines. Both
+    need a key for the judge service; this machine has none. No
+    request went to the real service.
+  - CI evidence: [run 43758283892](https://github.com/runlevellabs/demerzel/actions/runs/43758283892)
+    on `f1acccc`. Each job passed: both `test` jobs, `gates` with six
+    of six smoke tasks, `quality`, and `dependencies`.
+  - Two fixes after the first push, both from CI. `f476128`: CI uses
+    the latest stable toolchain, Rust 1.100, which deprecates the
+    atomic `fetch_update` method; the local toolchain is Rust 1.97, so
+    the lint passed locally. `f1acccc`: on macOS a mock test lost a
+    reply to a connection reset, because the mock's two fallback
+    handlers answered before they read the request body.
+  - Process: Opus 5.5 workers built this step in five packages in
+    sequence, from one design file, under a coordinator session.
+  - Crate API: the commit body of `0d7552e` lists it.
 
 ### 8b. Judgment actions and rules
 
@@ -2212,6 +2334,30 @@ for judgments. Letters keep the later step numbers stable.
   fixture set under `bench/eval/`; the gate report; the `config.md`
   update.
 - **Depends on:** step 8a and its dogfood records.
+- **From step 8a:**
+  - `ToolGate` needs a reason and an answer source, and `HostReply`
+    needs the note and the findings. Each is a new field on a
+    non-exhaustive struct. Today a host deny writes an `approval`
+    record without an `answer`, and the model reads the policy's
+    refusal text.
+  - A finding at `turn_end` has no place to go after the turn
+    returns. Decide between a wait at turn end and the notice path.
+    A notice from a late task shows after the next turn.
+  - The record needs `rules` and a field for the action that fired.
+    `checks` holds the configured action.
+  - The labeled set pairs records by call id. Make the made-up call
+    ids of the compatible adapters unique in a session, or add a link
+    field, before the gate uses the pairs.
+  - The config already refuses `warn`, `note`, `act`, and rules in the
+    user file. Step 8b changes those refusals into values.
+  - The mock's scripted judge gives one answer for each question id.
+    A task that fires a check at one event and not at the next needs
+    answers that vary.
+  - `busy` records do not count against `max_calls`, so a long turn
+    with a stalled judge writes one for each event. A judge that
+    refuses connections gives no notice. Decide both before a check
+    acts.
+  - The `doctor` alias note becomes a warning above `log`.
 - **Crates:** `demerzel-core`, `demerzel`, `demerzel-tui`.
 - **Contracts:** provider trait none; engine events `Judgment`; tools
   none; config the `warn`, `note`, and `act` actions and
@@ -2257,6 +2403,13 @@ for judgments. Letters keep the later step numbers stable.
 - **From step 8:** a compatible judge shares `/v1/chat/completions`
   with the model, with up to 8 requests in flight. One ordered reply
   list cannot serve both. Use the step 8a decision.
+- **From step 8a:** `check_reply` needs an answer for each question,
+  and the record has one `error` for the whole request. A question
+  that fails alone does not fit. The judge slot is in the judgments
+  module and builds only the `typesafe` kind; an instance that is a
+  model and a judge would build a second HTTP client. Only the backend
+  calls `check_reply`; call it in the runtime so each backend gets the
+  same rule. `AdapterRules.serves_judge` is the switch for the kind.
 - **Crates:** `demerzel-providers`, `demerzel`, `demerzel-mock`.
 - **Contracts:** provider trait none; engine events none; tools none;
   config `judgments.instance` accepts an `openai-compat` instance;
@@ -2452,6 +2605,13 @@ for judgments. Letters keep the later step numbers stable.
   `trust.json`; `dmz trust`; the first-prompt question; the one-shot
   skip; the `config.md` update.
 - **Depends on:** steps 7 and 8a (`LoopHost`).
+- **From step 8a:** a host that joins hooks, rules, and the approval
+  check lives in the binary crate. It cannot build the event structs,
+  which have no public constructor, and it cannot call `constrain`,
+  which is private to core. Add constructors or a copy with a new
+  decision, and make `constrain` public. A project role that names a
+  judge-only instance stops the run; the trust gate can look at that
+  rule again.
 - **Crates:** `demerzel-core`, `demerzel-tools`, `demerzel`,
   `demerzel-tui` (the trust question through the approval channel).
 - **Contracts:** provider trait none; engine events none; tools none;
@@ -2529,6 +2689,9 @@ for judgments. Letters keep the later step numbers stable.
   roles on `RunConfig` here. Every instance a role can name already
   has a provider slot. A child route needs its own `HeadPin`
   semantics: a child session resumes only through its parent.
+- **From step 8a:** each host makes its own call budget. A child
+  session needs the parent's budget handle. The in-flight limit of 8
+  already covers the whole run. The cap notice says "this session".
 - **Crates:** `demerzel` (the subagent runner), `demerzel-core`
   (`ToolContext`, events, session records), `demerzel-tui` (the card),
   `demerzel-tools` (the validator next to input parsing).
@@ -2589,6 +2752,10 @@ for judgments. Letters keep the later step numbers stable.
     data to the tag algorithm.
   - The Harbor verifier has no `DEMERZEL_EVAL_TASK_DIR` and no
     `expected/` directory. The adapter needs a conversion.
+- **From step 8a:** judge usage is in each `judgment` record's
+  `usage`, apart from model usage. A record with `error` holds no
+  usage. Pairs by call id have the limit that the step 8a notes
+  state.
 - **Crates:** `demerzel-core` (hashes and tool-set records). The rest is Python.
 - **Contracts:** provider trait none; engine events none; tools none;
   config none; session `meta.prompt_hash`, `meta.tools_hash`, `tool_set`;
@@ -2789,6 +2956,14 @@ step:
 - `prompt.base_file` has no size limit, because a replaced base prompt
   goes out as it is. The step 7 performance review asked for a refusal
   above 1 MiB.
+- The local Rust toolchain on the Linux reference machine is 1.97, and
+  CI runs the latest stable. A lint that only the newer toolchain has
+  fails CI after a clean local run. Update the local toolchain, or
+  pin the CI toolchain, as a decision of the owner.
+- The step 8a turn bench ran on a loaded machine. Run the text-turn
+  A/B against `179b521` again on a quiet machine. The bench has no
+  judged case with a tool turn; such a case must settle outside the
+  timed span.
 - A release build at the workspace root links a `demerzel` binary
   77,872 bytes larger than `cargo build --release -p demerzel`,
   because Cargo joins the features of the mock crate into the shared

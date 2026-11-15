@@ -24,6 +24,27 @@ material and actual outcomes.
 
 Model approval and passing CI do not replace review.
 
+State the assistance. The author of a commit is the person who submits
+it. Do not add a model as an author or a co-author, so do not use a
+`Co-authored-by` line for a model.
+
+End the commit message with one line for each harness and model that
+helped to write the change:
+
+```text
+Assisted-by: <harness>:<model>
+```
+
+The harness is the tool that ran the model. The model is the ID that
+the harness reports. Example:
+
+```text
+Assisted-by: Claude Code:claude-fable-5-2
+```
+
+Put the same lines at the end of the pull request body.
+A change without AI assistance needs no line.
+
 ## Local checks
 
 Run these before you open a pull request:
@@ -43,14 +64,28 @@ Run benchmark scripts only when the change can affect startup,
 memory, render cost, or harness overhead. See
 [`bench/README.md`](../bench/README.md).
 
+## Intent
+
+Each commit and each pull request states its intent.
+Say what the change does.
+Say why the change is necessary.
+Name the plan step, the issue, or the failure that the change answers.
+
+A short commit states its intent in the body, below the subject.
+
 ## Evidence
 
-Give accurate, reproducible verification in the pull request.
+Each commit and each pull request carries its evidence.
+A change without evidence does not land.
+Give accurate, reproducible verification in the commit body or in the
+pull request body.
 Include commands, observed outcomes, and relevant environment.
 Clearly list checks that you did not run.
 State each limit that affects the result.
 Run checks against the submitted version.
 Repeat affected checks after fixes.
+For a documentation change, the evidence is the checks that apply,
+such as the link check.
 
 For a behavior fix, include failure reproduction and regression coverage.
 For a performance claim, include benchmark evidence.
@@ -127,7 +162,9 @@ The area names the affected part of the project, such as `tui`,
 `providers`, `docs`, or `repo`.
 Write a short title that states the concrete change.
 Use the imperative, such as `add`, `fix`, or `remove`.
-Do not add a trailing period or AI attribution.
+Do not add a trailing period.
+Do not put AI attribution in the subject. See
+[AI assistance](#ai-assistance) for the line that states it.
 
 Examples:
 

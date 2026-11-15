@@ -17,3 +17,5 @@
 ## Contract growth
 
 <!-- List changes to the six public contracts. Otherwise, write Contract growth: none. -->
+
+<!-- End the body with one "Assisted-by: <harness>:<model>" line for each harness and model that helped. -->

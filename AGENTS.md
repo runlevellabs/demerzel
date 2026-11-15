@@ -21,9 +21,23 @@ current.
   `main`.
 - Use `<type>(area): short descriptive title` for commit subjects and
   pull request titles. The type and area are required.
-  Write the title in the imperative. Do not add AI attribution.
+  Write the title in the imperative. Keep AI attribution out of the
+  title.
   See [Commit subjects](docs/contributing.md#commit-subjects) for types
   and examples.
+- Commits and pull requests go up under the name of the person who
+  submits them. State the harness and the model that helped to write
+  the change. End each commit message and each pull request body with
+  one `Assisted-by: <harness>:<model>` line for each pair. Use the
+  model ID that the harness reports. Do not add a model as an author
+  or a co-author. See
+  [AI assistance](docs/contributing.md#ai-assistance).
+- Every contribution states its intent and carries its evidence. This
+  rule covers each commit and each pull request, not only plan steps.
+  The intent says what the change does and why it is necessary. The
+  evidence names each command, its result, and the tested revision.
+  See [Intent](docs/contributing.md#intent) and
+  [Evidence](docs/contributing.md#evidence).
 - Before you open a pull request, run these checks and make them pass:
   1. `cargo fmt`
   2. `cargo clippy --workspace --all-targets -- -D warnings`
@@ -92,7 +106,9 @@ period:
 
 - Commit each plan step to `main`. Use one commit, or a short series
   when the step splits cleanly. Push after the step's checks pass.
-- The commit subject rules stay.
+- The commit subject rules stay. The attribution, intent, and evidence
+  rules stay. A commit that is not a plan step states its intent and
+  its evidence in its body.
 - Run the three Rust checks above before each commit. Run the affected
   commands from [Local verification](docs/ci.md#local-verification)
   before you push. Local results replace CI evidence. Record each

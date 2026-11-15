@@ -204,11 +204,19 @@ impl Budget {
 
     /// Take one request from the budget; `false` at the cap.
     fn take(&self) -> bool {
-        self.used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                (used < self.cap).then_some(used + 1)
-            })
-            .is_ok()
+        let mut used = self.used.load(Ordering::Acquire);
+        while used < self.cap {
+            match self.used.compare_exchange_weak(
+                used,
+                used + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(current) => used = current,
+            }
+        }
+        false
     }
 
     /// The session's one cap notice, the first time.

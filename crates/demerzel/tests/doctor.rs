@@ -1196,10 +1196,10 @@ fn doctor_says_judgments_are_off_and_lists_the_ignored_project_keys() {
     );
     bed.write_project_config("");
 
-    // The same value in the user file is a problem.
+    // An invalid check action in the user file is a problem.
     bed.write_user_config(
         "[providers.judge]\nkind = \"typesafe\"\n\
-         [judgments]\ninstance = \"judge\"\nchecks = { outcome = \"warn\" }",
+         [judgments]\ninstance = \"judge\"\nchecks = { outcome = \"act\" }",
     );
     let (out, code) = bed.doctor(&[]);
     assert_eq!(code, 1, "{out}");
@@ -1208,6 +1208,40 @@ fn doctor_says_judgments_are_off_and_lists_the_ignored_project_keys() {
             .iter()
             .any(|line| line.starts_with("problem:") && line.contains("judgments.checks.outcome")),
         "{out}"
+    );
+
+    // An alias model becomes a warning when any check or rule acts
+    // above `log`, and doctor lists each rule with its source.
+    bed.write_user_config(
+        "[providers.judge]\nkind = \"typesafe\"\n\
+         [judgments]\ninstance = \"judge\"\nchecks = { outcome = \"warn\" }\n\
+         [[judgments.rules]]\nevent = \"tool_before\"\ntool = \"bash\"\n\
+         ask = \"Does this touch auth?\"\naction = \"deny\"",
+    );
+    bed.write_project_config(
+        "[[judgments.rules]]\nevent = \"tool_after\"\n\
+         ask = \"Did this leak secrets?\"\naction = \"warn\"",
+    );
+    let (out, code) = bed.doctor(&[]);
+    assert_eq!(code, 0, "{out}");
+    let section = judgments_section(&out);
+    assert!(
+        section
+            .iter()
+            .any(|line| line.starts_with("warning:") && line.contains("jev-latest")),
+        "{section:?}"
+    );
+    assert!(
+        section
+            .iter()
+            .any(|line| line.contains("rule.0") && line.contains("user file")),
+        "{section:?}"
+    );
+    assert!(
+        section
+            .iter()
+            .any(|line| line.contains("rule.1") && line.contains("project file")),
+        "{section:?}"
     );
 }
 

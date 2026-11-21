@@ -282,9 +282,9 @@ fn bench_turns(c: &mut Criterion) {
     let bed = Bed::start_with(vec![compat::text_turn("done")], |config| {
         compat_with_judge(config, true);
     });
-    bed.mock.set_judge(demerzel_mock::JudgeScript {
-        model: JUDGE_MODEL.into(),
-        answers: [
+    bed.mock.set_judge(demerzel_mock::JudgeScript::new(
+        JUDGE_MODEL,
+        [
             "approval.destructive",
             "approval.in_scope",
             "outcome",
@@ -294,7 +294,7 @@ fn bench_turns(c: &mut Criterion) {
         .into_iter()
         .map(|id| (id.to_string(), demerzel_mock::systemone::noul(0.5)))
         .collect(),
-    });
+    ));
     c.bench_function("turn_text_judged", |b| {
         b.to_async(&bench_rt).iter_custom(|iters| {
             let bed = &bed;

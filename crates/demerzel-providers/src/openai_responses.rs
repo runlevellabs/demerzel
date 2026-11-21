@@ -320,6 +320,9 @@ struct StreamState {
     secret: String,
     instance: String,
     model: String,
+    /// Per-stream random prefix for synthesized call ids when the wire
+    /// omits one, so ids stay unique across turns and resumes.
+    call_nonce: Option<String>,
 }
 
 impl PayloadMapper for StreamState {
@@ -531,7 +534,10 @@ impl StreamState {
                 // name from the output index.
                 call.call_id = match (item["id"].as_str().filter(|id| !id.is_empty()), key) {
                     (Some(id), _) => id.to_string(),
-                    (None, ItemKey::Index(index)) => format!("call_{index}"),
+                    (None, ItemKey::Index(index)) => {
+                        let nonce = self.call_nonce.get_or_insert_with(crate::random_call_nonce);
+                        format!("call_{nonce}_{index}")
+                    }
                     (None, ItemKey::Id(id)) => id.clone(),
                 };
             }

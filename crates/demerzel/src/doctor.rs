@@ -591,10 +591,16 @@ fn report_judgments(
             key_state(name, variable, rules, stored)
         )?;
         if instance.kind == typesafe::PROVIDER_ID && typesafe::is_alias(model) {
+            let level = if own.acts_above_log() {
+                "warning"
+            } else {
+                "note"
+            };
             writeln!(
                 out,
-                "  note: the model `{model}` is an alias. The alias can move to a new version, \
-                 and its answers can change. A pinned version id, such as jev-1.14.0, stays fixed."
+                "  {level}: the model `{model}` is an alias. The alias can move to a new \
+                 version, and its answers can change. A pinned version id, such as jev-1.14.0, \
+                 stays fixed."
             )?;
         }
         // Without a key the judge does not build: the session runs,
@@ -639,7 +645,24 @@ fn report_judgments(
         "max_calls",
         &own.max_calls.value.to_string(),
         own.max_calls.origin,
-    )
+    )?;
+    if own.rules.is_empty() {
+        writeln!(out, "  rules = none")?;
+    } else {
+        for (index, rule) in own.rules.iter().enumerate() {
+            let tool = rule
+                .tool
+                .as_deref()
+                .map(|t| format!(" tool={t}"))
+                .unwrap_or_default();
+            writeln!(
+                out,
+                "  rule.{index} = [{}]{tool} {} (threshold {:.2}) \"{}\" ({})",
+                rule.event, rule.action, rule.threshold, rule.ask, rule.origin
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// What the store holds for one instance, read the way a session

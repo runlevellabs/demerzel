@@ -30,6 +30,11 @@
       "name": "judged-run",
       "source_step": "m3-8a",
       "summary": "A scripted judge answers each check at log; the files, the counts, and the judgment records match."
+    },
+    {
+      "name": "judged-actions",
+      "source_step": "m3-8b",
+      "summary": "A scripted judge with varying answers denies a rule-blocked bash call and appends a note to a later tool result."
     }
   ]
 }

@@ -47,6 +47,8 @@ pub const DEFAULT_JUDGE_MAX_CALLS: u32 = 500;
 /// The action of a built-in check when nothing sets one and a judge
 /// instance exists.
 pub const DEFAULT_CHECK_ACTION: CheckAction = CheckAction::Log;
+/// The default firing threshold for a plain-language judgment rule.
+pub const DEFAULT_RULE_THRESHOLD: f64 = 0.8;
 
 /// Environment variables, one per flag.
 pub const ENV_PROVIDER: &str = "DEMERZEL_PROVIDER";
@@ -155,12 +157,26 @@ pub struct JudgmentSettings {
     pub checks: BTreeMap<Check, Setting<CheckAction>>,
     /// Judgment requests one session may send.
     pub max_calls: Setting<u32>,
-    /// User-file check values that are not valid: each stops the run.
+    /// Plain-language rules from the user file, then the project file.
+    pub rules: Vec<Rule>,
+    /// User-file check or rule values that are not valid: each stops
+    /// the run.
     pub problems: Vec<String>,
     /// The project-file judgment keys the trust rule ignored. The
     /// warnings of [`resolve`] hold them too; `doctor` prints them in
     /// its judgments section.
     pub ignored: Vec<String>,
+}
+
+impl JudgmentSettings {
+    /// Whether any check or rule acts above `log` (`warn`, `note`,
+    /// `act`, or `deny`).
+    pub fn acts_above_log(&self) -> bool {
+        self.checks
+            .values()
+            .any(|setting| setting.value > CheckAction::Log)
+            || self.rules.iter().any(|rule| rule.action != RuleAction::Log)
+    }
 }
 
 /// A built-in judgment check.
@@ -203,6 +219,35 @@ impl Check {
             .copied()
             .find(|check| check.as_str() == name)
     }
+
+    /// The actions valid for this check, in rank order.
+    pub fn valid_actions(self) -> &'static [CheckAction] {
+        match self {
+            Check::Outcome | Check::Progress => &[
+                CheckAction::Off,
+                CheckAction::Log,
+                CheckAction::Warn,
+                CheckAction::Note,
+            ],
+            Check::Claim => &[CheckAction::Off, CheckAction::Log, CheckAction::Warn],
+            Check::Approval => &[
+                CheckAction::Off,
+                CheckAction::Log,
+                CheckAction::Warn,
+                CheckAction::Act,
+            ],
+        }
+    }
+
+    /// Parse an action valid for this check.
+    pub fn parse_action(self, text: &str) -> Result<CheckAction, String> {
+        let valid = self.valid_actions();
+        valid
+            .iter()
+            .copied()
+            .find(|action| action.as_str() == text)
+            .ok_or_else(|| format!("must be {}, not `{text}`", format_list(valid)))
+    }
 }
 
 impl fmt::Display for Check {
@@ -220,17 +265,33 @@ pub enum CheckAction {
     Off,
     /// The session file records the answers. Nothing else changes.
     Log,
+    /// Records and emits a finding on the tool card or turn.
+    Warn,
+    /// As `Warn`, plus appends a note to the tool result (`tool_after`
+    /// checks only).
+    Note,
+    /// Changes the approval decision (`approval` check only).
+    Act,
 }
 
 impl CheckAction {
-    /// Every action this build takes, in rank order.
-    pub const ALL: &'static [CheckAction] = &[CheckAction::Off, CheckAction::Log];
+    /// Every check action this build knows, in rank order.
+    pub const ALL: &'static [CheckAction] = &[
+        CheckAction::Off,
+        CheckAction::Log,
+        CheckAction::Warn,
+        CheckAction::Note,
+        CheckAction::Act,
+    ];
 
     /// The action's config value.
     pub fn as_str(self) -> &'static str {
         match self {
             CheckAction::Off => "off",
             CheckAction::Log => "log",
+            CheckAction::Warn => "warn",
+            CheckAction::Note => "note",
+            CheckAction::Act => "act",
         }
     }
 }
@@ -249,16 +310,150 @@ impl std::str::FromStr for CheckAction {
             .iter()
             .copied()
             .find(|action| action.as_str() == text)
-            .ok_or_else(|| format!("must be {}, not `{text}`", check_actions()))
+            .ok_or_else(|| format!("must be {}, not `{text}`", format_list(Self::ALL)))
     }
 }
 
-/// The valid action values as a phrase: "`off` or `log`".
-fn check_actions() -> String {
-    let names: Vec<String> = CheckAction::ALL
-        .iter()
-        .map(|action| format!("`{action}`"))
-        .collect();
+/// The loop event at which a `[[judgments.rules]]` entry asks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum RuleEvent {
+    ToolBefore,
+    ToolAfter,
+    TurnEnd,
+}
+
+impl RuleEvent {
+    pub const ALL: &'static [RuleEvent] = &[
+        RuleEvent::ToolBefore,
+        RuleEvent::ToolAfter,
+        RuleEvent::TurnEnd,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RuleEvent::ToolBefore => "tool_before",
+            RuleEvent::ToolAfter => "tool_after",
+            RuleEvent::TurnEnd => "turn_end",
+        }
+    }
+
+    /// Actions valid for a rule on this event. A rule can never
+    /// approve a call.
+    pub fn valid_actions(self) -> &'static [RuleAction] {
+        match self {
+            RuleEvent::ToolBefore => &[RuleAction::Log, RuleAction::Warn, RuleAction::Deny],
+            RuleEvent::ToolAfter => &[RuleAction::Log, RuleAction::Warn, RuleAction::Note],
+            RuleEvent::TurnEnd => &[RuleAction::Log, RuleAction::Warn],
+        }
+    }
+
+    pub fn parse_action(self, text: &str) -> Result<RuleAction, String> {
+        let valid = self.valid_actions();
+        valid
+            .iter()
+            .copied()
+            .find(|action| action.as_str() == text)
+            .ok_or_else(|| format!("must be {}, not `{text}`", format_list(valid)))
+    }
+}
+
+impl fmt::Display for RuleEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for RuleEvent {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, String> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|event| event.as_str() == text)
+            .ok_or_else(|| format!("must be {}, not `{text}`", format_list(Self::ALL)))
+    }
+}
+
+/// What a plain-language judgment rule does when its probability
+/// reaches `threshold`. No variant approves a call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum RuleAction {
+    Log,
+    Warn,
+    Note,
+    Deny,
+}
+
+impl RuleAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RuleAction::Log => "log",
+            RuleAction::Warn => "warn",
+            RuleAction::Note => "note",
+            RuleAction::Deny => "deny",
+        }
+    }
+}
+
+impl fmt::Display for RuleAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One resolved `[[judgments.rules]]` entry.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct Rule {
+    pub event: RuleEvent,
+    /// Optional tool name filter (`tool_before` and `tool_after` only).
+    pub tool: Option<String>,
+    /// The yes-or-no question sent to the judge.
+    pub ask: String,
+    /// Firing threshold strictly between `0.0` and `1.0` (default `0.8`).
+    pub threshold: f64,
+    pub action: RuleAction,
+    /// Message shown or returned when the rule fires; defaults to `ask`.
+    pub reason: String,
+    /// Which config file defined the rule (`Origin::User` or `Origin::Project`).
+    pub origin: Origin,
+}
+
+impl Rule {
+    pub fn new(
+        event: RuleEvent,
+        ask: impl Into<String>,
+        action: RuleAction,
+        origin: Origin,
+    ) -> Self {
+        let ask = ask.into();
+        let reason = ask.clone();
+        Self {
+            event,
+            tool: None,
+            ask,
+            threshold: DEFAULT_RULE_THRESHOLD,
+            action,
+            reason,
+            origin,
+        }
+    }
+
+    /// Short origin name stored in session `judgment` records.
+    pub fn source_name(&self) -> &'static str {
+        match self.origin {
+            Origin::Project => "project",
+            _ => "user",
+        }
+    }
+}
+
+/// Format a slice of displayable values as a phrase: `` `a`, `b`, or `c` ``.
+fn format_list<T: fmt::Display>(values: &[T]) -> String {
+    let names: Vec<String> = values.iter().map(|value| format!("`{value}`")).collect();
     match names.split_last() {
         Some((last, [])) => last.clone(),
         Some((last, [first])) => format!("{first} or {last}"),
@@ -268,7 +463,7 @@ fn check_actions() -> String {
 }
 
 /// The judgments of a run, checked at boot by [`judgments`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct Judgments {
     /// The judge instance: one of the run's configured instances,
@@ -277,6 +472,8 @@ pub struct Judgments {
     pub checks: Checks,
     /// Judgment requests one session may send.
     pub max_calls: u32,
+    /// Plain-language rules from user and project config.
+    pub rules: Vec<Rule>,
 }
 
 /// The action of each built-in check.
@@ -290,13 +487,14 @@ pub struct Checks {
 }
 
 impl Judgments {
-    /// Judgments by `instance` with every check at its default action
-    /// and the default call cap.
+    /// Judgments by `instance` with every check at its default action,
+    /// no rules, and the default call cap.
     pub fn new(instance: impl Into<String>) -> Self {
         Self {
             instance: instance.into(),
             checks: Checks::uniform(DEFAULT_CHECK_ACTION),
             max_calls: DEFAULT_JUDGE_MAX_CALLS,
+            rules: Vec::new(),
         }
     }
 }
@@ -469,6 +667,17 @@ struct TuiKeys {
     theme: Option<String>,
 }
 
+/// One parsed `[[judgments.rules]]` entry before its origin is attached.
+#[derive(Debug, Clone, PartialEq)]
+struct ParsedRule {
+    event: RuleEvent,
+    tool: Option<String>,
+    ask: String,
+    threshold: f64,
+    action: RuleAction,
+    reason: String,
+}
+
 /// Judgment keys from the `[judgments]` table.
 #[derive(Debug, Clone, Default, PartialEq)]
 struct JudgmentKeys {
@@ -478,9 +687,10 @@ struct JudgmentKeys {
     /// a project file's value never stops a run.
     checks: BTreeMap<Check, String>,
     max_calls: Option<u32>,
-    /// Whether the file sets `judgments.rules`, which this build does
-    /// not run. The resolver decides by the file: a stop or a warning.
-    rules: bool,
+    /// Parsed `[[judgments.rules]]` entries, or per-entry validation
+    /// errors. The resolver turns user-file errors into boot problems
+    /// and project-file errors into warnings.
+    rules: Vec<Result<ParsedRule, String>>,
 }
 
 /// The roles one `[theme.<name>]` table sets, in key order. `None`
@@ -784,11 +994,114 @@ fn parse_judgments(
                     into.checks.insert(check, raw);
                 }
             }
-            "rules" => into.rules = true,
+            "rules" => {
+                let toml::Value::Array(items) = value else {
+                    return Err(format!(
+                        "`{path}` must be an array of tables, not {}",
+                        value.type_str()
+                    ));
+                };
+                for (index, item) in items.into_iter().enumerate() {
+                    let rule_path = format!("{path}[{index}]");
+                    let toml::Value::Table(table) = item else {
+                        return Err(format!(
+                            "`{rule_path}` must be a table, not {}",
+                            item.type_str()
+                        ));
+                    };
+                    into.rules
+                        .push(parse_judgment_rule(&rule_path, table, warnings));
+                }
+            }
             _ => warnings.push(format!("unknown key `{path}`")),
         }
     }
     Ok(())
+}
+
+/// Parse one `[[judgments.rules]]` table. Semantic errors return `Err`
+/// so the resolver stops on a user rule and warns on a project rule.
+fn parse_judgment_rule(
+    path: &str,
+    table: toml::map::Map<String, toml::Value>,
+    warnings: &mut Vec<String>,
+) -> Result<ParsedRule, String> {
+    let mut event: Option<String> = None;
+    let mut tool: Option<String> = None;
+    let mut ask: Option<String> = None;
+    let mut threshold: Option<f64> = None;
+    let mut action: Option<String> = None;
+    let mut reason: Option<String> = None;
+    for (key, value) in table {
+        let field = format!("{path}.{key}");
+        match key.as_str() {
+            "event" => event = Some(expect_string(&field, value)?),
+            "tool" => {
+                let text = expect_string(&field, value)?;
+                if text.trim().is_empty() {
+                    return Err(format!("`{field}` must not be empty"));
+                }
+                tool = Some(text);
+            }
+            "ask" => {
+                let text = expect_string(&field, value)?;
+                if text.trim().is_empty() {
+                    return Err(format!("`{field}` must not be empty"));
+                }
+                ask = Some(text);
+            }
+            "threshold" => {
+                let number = match value {
+                    toml::Value::Float(v) => v,
+                    toml::Value::Integer(v) => v as f64,
+                    other => {
+                        return Err(format!(
+                            "`{field}` must be a number strictly between 0 and 1, not {}",
+                            other.type_str()
+                        ));
+                    }
+                };
+                if !(number > 0.0 && number < 1.0) {
+                    return Err(format!(
+                        "`{field}` must be strictly between 0 and 1, not `{number}`"
+                    ));
+                }
+                threshold = Some(number);
+            }
+            "action" => action = Some(expect_string(&field, value)?),
+            "reason" => {
+                let text = expect_string(&field, value)?;
+                if text.trim().is_empty() {
+                    return Err(format!("`{field}` must not be empty"));
+                }
+                reason = Some(text);
+            }
+            _ => warnings.push(format!("unknown key `{field}`")),
+        }
+    }
+    let event_raw = event.ok_or_else(|| format!("`{path}` needs `event`"))?;
+    let event = event_raw
+        .parse::<RuleEvent>()
+        .map_err(|err| format!("`{path}.event` {err}"))?;
+    if event == RuleEvent::TurnEnd && tool.is_some() {
+        return Err(format!(
+            "`{path}.tool` is not valid for `turn_end`: a turn-end event has no single tool"
+        ));
+    }
+    let ask = ask.ok_or_else(|| format!("`{path}` needs `ask`"))?;
+    let action_raw = action.ok_or_else(|| format!("`{path}` needs `action`"))?;
+    let action = event
+        .parse_action(&action_raw)
+        .map_err(|err| format!("`{path}.action` {err} for event `{event}`"))?;
+    let reason = reason.unwrap_or_else(|| ask.clone());
+    Ok(ParsedRule {
+        event,
+        tool,
+        ask,
+        threshold: threshold.unwrap_or(DEFAULT_RULE_THRESHOLD),
+        action,
+        reason,
+    })
 }
 
 /// The `[theme.<name>]` tables: one role per key, a color per value.
@@ -1572,21 +1885,40 @@ fn resolve_judgments(project: Option<&Layer>, user: Option<&Layer>) -> JudgmentS
     let instance = layer_key(user, Origin::User, |l| l.judgments.instance.clone())
         .map(some_setting)
         .unwrap_or_else(|| Setting::new(None, Origin::Default));
-    // A rule the user wrote to protect something must not do nothing
-    // without a word: this build runs no rules, so the run stops.
-    if user.is_some_and(|l| l.judgments.rules) {
-        problems.push(
-            "`judgments.rules` is not in this build: it runs only the built-in checks; remove \
-             the rules from the user file"
-                .to_string(),
-        );
+    let mut rules = Vec::new();
+    if let Some(user) = user {
+        for entry in &user.judgments.rules {
+            match entry {
+                Ok(parsed) => rules.push(Rule {
+                    event: parsed.event,
+                    tool: parsed.tool.clone(),
+                    ask: parsed.ask.clone(),
+                    threshold: parsed.threshold,
+                    action: parsed.action,
+                    reason: parsed.reason.clone(),
+                    origin: Origin::User,
+                }),
+                Err(error) => problems.push(error.clone()),
+            }
+        }
     }
-    if project.is_some_and(|l| l.judgments.rules) {
-        ignored.push(
-            "ignored: the project file sets judgments.rules; this build runs only the built-in \
-             checks"
-                .to_string(),
-        );
+    if let Some(project) = project {
+        for entry in &project.judgments.rules {
+            match entry {
+                Ok(parsed) => rules.push(Rule {
+                    event: parsed.event,
+                    tool: parsed.tool.clone(),
+                    ask: parsed.ask.clone(),
+                    threshold: parsed.threshold,
+                    action: parsed.action,
+                    reason: parsed.reason.clone(),
+                    origin: Origin::Project,
+                }),
+                Err(error) => ignored.push(format!(
+                    "ignored: the project file has an invalid judgment rule: {error}"
+                )),
+            }
+        }
     }
     // A project file cannot change the judge: each key of its table
     // for the judge instance is ignored. `resolve_layers` drops them.
@@ -1604,7 +1936,7 @@ fn resolve_judgments(project: Option<&Layer>, user: Option<&Layer>) -> JudgmentS
     let mut checks = BTreeMap::new();
     for &check in Check::ALL {
         let user_check = match user.and_then(|l| l.judgments.checks.get(&check)) {
-            Some(raw) => match raw.parse::<CheckAction>() {
+            Some(raw) => match check.parse_action(raw) {
                 Ok(action) => Some(Setting::new(action, Origin::User)),
                 Err(error) => {
                     problems.push(format!("`judgments.checks.{check}` {error}"));
@@ -1617,7 +1949,7 @@ fn resolve_judgments(project: Option<&Layer>, user: Option<&Layer>) -> JudgmentS
             .as_ref()
             .map_or(DEFAULT_CHECK_ACTION, |setting| setting.value);
         let project_check = match project.and_then(|l| l.judgments.checks.get(&check)) {
-            Some(raw) => match raw.parse::<CheckAction>() {
+            Some(raw) => match check.parse_action(raw) {
                 Ok(action) if action > baseline => {
                     ignored.push(format!(
                         "ignored: the project file sets judgments.checks.{check} = {action}; \
@@ -1665,6 +1997,7 @@ fn resolve_judgments(project: Option<&Layer>, user: Option<&Layer>) -> JudgmentS
         instance,
         checks,
         max_calls,
+        rules,
         problems,
         ignored,
     }
@@ -1947,6 +2280,7 @@ pub fn judgments(settings: &Settings, instances: &[Resolved]) -> Result<Option<J
         instance,
         checks,
         max_calls: own.max_calls.value,
+        rules: own.rules.clone(),
     }))
 }
 
@@ -3801,63 +4135,121 @@ mod tests {
     }
 
     #[test]
-    fn a_user_check_value_outside_off_and_log_stops_the_run() {
-        for value in ["\"warn\"", "\"act\"", "\"note\"", "\"LOG\"", "1", "true"] {
+    fn a_user_check_value_outside_its_valid_actions_stops_the_run() {
+        // Each check accepts its valid actions and rejects invalid ones.
+        let valid = judge_user(
+            "[judgments]\ninstance = \"judge\"\n\
+             checks = { outcome = \"note\", progress = \"warn\", claim = \"warn\", approval = \"act\" }",
+        );
+        let (result, warnings) = run_judgments(None, Some(&valid));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let j = result.unwrap().unwrap();
+        assert_eq!(j.checks.outcome, CheckAction::Note);
+        assert_eq!(j.checks.progress, CheckAction::Warn);
+        assert_eq!(j.checks.claim, CheckAction::Warn);
+        assert_eq!(j.checks.approval, CheckAction::Act);
+
+        for (check, value) in [
+            ("outcome", "\"act\""),
+            ("outcome", "\"deny\""),
+            ("outcome", "\"LOG\""),
+            ("outcome", "1"),
+            ("claim", "\"note\""),
+            ("claim", "\"act\""),
+            ("approval", "\"note\""),
+            ("approval", "\"deny\""),
+            ("approval", "true"),
+        ] {
             let text =
-                format!("[judgments]\ninstance = \"judge\"\nchecks = {{ outcome = {value} }}");
-            // The parse takes the value; the resolution refuses it.
+                format!("[judgments]\ninstance = \"judge\"\nchecks = {{ {check} = {value} }}");
             let user = judge_user(&text);
             let (result, warnings) = run_judgments(None, Some(&user));
-            assert!(warnings.is_empty(), "{value}: {warnings:?}");
+            assert!(warnings.is_empty(), "{check}={value}: {warnings:?}");
             let error = result.unwrap_err();
-            for part in ["judgments.checks.outcome", "`off`", "`log`"] {
-                assert!(error.contains(part), "{value}: {error}");
-            }
-            // Without an instance, the value still stops the run: the
-            // user file has an error.
-            let user = layer(&format!("[judgments]\nchecks = {{ claim = {value} }}"));
-            let (result, _) = run_judgments(None, Some(&user));
-            assert!(result.is_err(), "{value}");
+            assert!(
+                error.contains(&format!("judgments.checks.{check}")),
+                "{check}={value}: {error}"
+            );
+            // Without an instance, an invalid user value still stops the run.
+            let user = layer(&format!("[judgments]\nchecks = {{ {check} = {value} }}"));
+            assert!(
+                run_judgments(None, Some(&user)).0.is_err(),
+                "{check}={value}"
+            );
         }
     }
 
     #[test]
-    fn a_project_check_value_outside_off_and_log_is_ignored_with_a_warning() {
-        let user = judge_user("[judgments]\ninstance = \"judge\"\nchecks = { claim = \"off\" }");
+    fn a_project_check_can_lower_but_never_raise_or_use_invalid_actions() {
+        let user = judge_user(
+            "[judgments]\ninstance = \"judge\"\n\
+             checks = { outcome = \"note\", claim = \"off\", approval = \"act\" }",
+        );
+        // Project can lower outcome note->warn and approval act->log.
+        let lower = layer("[judgments]\nchecks = { outcome = \"warn\", approval = \"log\" }");
+        let (result, warnings) = run_judgments(Some(&lower), Some(&user));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let j = result.unwrap().unwrap();
+        assert_eq!(j.checks.outcome, CheckAction::Warn);
+        assert_eq!(j.checks.approval, CheckAction::Log);
+
+        // Project cannot raise claim off->warn or use invalid values.
         for value in ["\"warn\"", "\"act\"", "\"\"", "2"] {
             let project = layer(&format!(
-                "[judgments]\nchecks = {{ outcome = {value}, claim = {value} }}"
+                "[judgments]\nchecks = {{ progress = {value}, claim = {value} }}"
             ));
             let (result, warnings) = run_judgments(Some(&project), Some(&user));
             assert_eq!(warnings.len(), 2, "{value}: {warnings:?}");
-            assert!(
-                warnings
-                    .iter()
-                    .all(|w| w.contains("`off`") && w.contains("`log`")),
-                "{value}: {warnings:?}"
-            );
             let judgments = result.unwrap().unwrap();
-            assert_eq!(judgments.checks.outcome, CheckAction::Log);
+            assert_eq!(judgments.checks.progress, CheckAction::Log);
             assert_eq!(judgments.checks.claim, CheckAction::Off);
         }
     }
 
     #[test]
-    fn judgment_rules_stop_the_run_in_the_user_file_and_warn_in_a_project_file() {
-        let rules = "[[judgments.rules]]\nevent = \"tool_before\"\nask = \"x\"\naction = \"deny\"";
-        // In the user file, the run stops, with or without an instance.
-        for extra in ["", "[judgments]\ninstance = \"judge\"\n"] {
-            let user = judge_user(&format!("{extra}{rules}"));
-            let (result, warnings) = run_judgments(None, Some(&user));
-            let error = result.unwrap_err();
-            assert!(error.contains("judgments.rules"), "{error}");
-            assert!(warnings.is_empty(), "{warnings:?}");
-        }
-        // In a project file, a warning; the run goes on.
-        let user = judge_user("[judgments]\ninstance = \"judge\"");
-        let project = layer(rules);
+    fn judgment_rules_resolve_from_user_and_project_with_trust_rules() {
+        let user_rule = "[[judgments.rules]]\n\
+                         event = \"tool_before\"\n\
+                         tool = \"bash\"\n\
+                         ask = \"Does this touch auth?\"\n\
+                         action = \"deny\"\n\
+                         reason = \"auth is off limits\"";
+        let project_rule = "[[judgments.rules]]\n\
+                            event = \"tool_after\"\n\
+                            ask = \"Did this leak secrets?\"\n\
+                            threshold = 0.7\n\
+                            action = \"note\"";
+        let user = judge_user(&format!("[judgments]\ninstance = \"judge\"\n{user_rule}"));
+        let project = layer(project_rule);
         let (result, warnings) = run_judgments(Some(&project), Some(&user));
-        assert_eq!(result.unwrap().unwrap().instance, "judge");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let j = result.unwrap().unwrap();
+        assert_eq!(j.rules.len(), 2);
+        assert_eq!(j.rules[0].event, RuleEvent::ToolBefore);
+        assert_eq!(j.rules[0].tool.as_deref(), Some("bash"));
+        assert_eq!(j.rules[0].action, RuleAction::Deny);
+        assert_eq!(j.rules[0].threshold, DEFAULT_RULE_THRESHOLD);
+        assert_eq!(j.rules[0].reason, "auth is off limits");
+        assert_eq!(j.rules[0].origin, Origin::User);
+        assert_eq!(j.rules[1].event, RuleEvent::ToolAfter);
+        assert_eq!(j.rules[1].tool, None);
+        assert_eq!(j.rules[1].action, RuleAction::Note);
+        assert_eq!(j.rules[1].threshold, 0.7);
+        assert_eq!(j.rules[1].reason, "Did this leak secrets?");
+        assert_eq!(j.rules[1].origin, Origin::Project);
+
+        // An invalid rule (e.g. trying to approve with `act` or `allow`)
+        // stops in the user file and warns in the project file.
+        let bad_rule = "[[judgments.rules]]\n\
+                        event = \"tool_before\"\n\
+                        ask = \"Safe?\"\n\
+                        action = \"act\"";
+        let bad_user = judge_user(&format!("[judgments]\ninstance = \"judge\"\n{bad_rule}"));
+        assert!(run_judgments(None, Some(&bad_user)).0.is_err());
+
+        let bad_project = layer(bad_rule);
+        let (result, warnings) = run_judgments(Some(&bad_project), Some(&user));
+        assert_eq!(result.unwrap().unwrap().rules.len(), 1);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("judgments.rules"), "{warnings:?}");
     }
@@ -3895,9 +4287,39 @@ mod tests {
             "[judgments]\nmax_calls = 0",
             "[judgments]\nmax_calls = \"5\"",
             "[judgments]\nchecks = \"log\"",
+            "[judgments]\nrules = \"bad\"",
+            "[judgments]\nrules = [123]",
         ] {
             assert!(Layer::parse(text).is_err(), "{text}");
         }
+    }
+
+    #[test]
+    fn judgment_rule_threshold_and_turn_end_tool_boundaries() {
+        for bad in [
+            "threshold = 0",
+            "threshold = 0.0",
+            "threshold = 1",
+            "threshold = 1.0",
+            "threshold = -0.1",
+            "threshold = 1.1",
+            "threshold = nan",
+            "threshold = inf",
+        ] {
+            let user = judge_user(&format!(
+                "[judgments]\ninstance = \"judge\"\n\
+                 [[judgments.rules]]\nevent = \"tool_before\"\nask = \"Q?\"\naction = \"deny\"\n{bad}"
+            ));
+            let (res, _) = run_judgments(None, Some(&user));
+            assert!(res.is_err(), "user rule should reject {bad}");
+        }
+        // `turn_end` rule cannot set `tool`.
+        let user = judge_user(
+            "[judgments]\ninstance = \"judge\"\n\
+             [[judgments.rules]]\nevent = \"turn_end\"\ntool = \"bash\"\nask = \"Q?\"\naction = \"warn\"",
+        );
+        let (res, _) = run_judgments(None, Some(&user));
+        assert!(res.is_err());
     }
 
     #[test]

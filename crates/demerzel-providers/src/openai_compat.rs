@@ -323,6 +323,9 @@ struct StreamState {
     secret: String,
     instance: String,
     model: String,
+    /// Per-stream random prefix for synthesized call ids when the wire
+    /// omits one, so ids stay unique across turns and resumes.
+    call_nonce: Option<String>,
 }
 
 impl PayloadMapper for StreamState {
@@ -361,10 +364,19 @@ impl StreamState {
         }));
     }
 
+    /// Synthesize a session-unique call id when the wire omits one.
+    fn synthetic_call_id(&mut self, index: u64) -> String {
+        let nonce = self.call_nonce.get_or_insert_with(crate::random_call_nonce);
+        format!("call_{nonce}_{index}")
+    }
+
     /// End every accumulated tool call, in index order.
     fn end_calls(&mut self, out: &mut Vec<Result<StreamEvent, ProviderError>>) {
         for (index, mut call) in std::mem::take(&mut self.calls) {
-            let id = call.id.take().unwrap_or_else(|| format!("call_{index}"));
+            let id = call
+                .id
+                .take()
+                .unwrap_or_else(|| self.synthetic_call_id(index));
             if !call.started {
                 out.push(Ok(StreamEvent::ToolCallStart {
                     id: id.clone(),
@@ -715,13 +727,33 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(
-            ends,
-            vec![
-                ("call_0".to_string(), json!({"path": "a"})),
-                ("call_1".to_string(), json!({"pattern": "x"})),
-            ]
+        assert_eq!(ends.len(), 2);
+        assert!(ends[0].0.starts_with("call_") && ends[0].0.ends_with("_0"));
+        assert!(ends[1].0.starts_with("call_") && ends[1].0.ends_with("_1"));
+        assert_ne!(ends[0].0, ends[1].0);
+        assert_eq!(ends[0].1, json!({"path": "a"}));
+        assert_eq!(ends[1].1, json!({"pattern": "x"}));
+
+        // A second stream gets distinct made-up ids so turns do not collide.
+        let mut second = self::state();
+        let got2 = events(
+            &mut second,
+            &[
+                &chunk(
+                    json!({"tool_calls": [{"function": {"name": "read", "arguments": "{\"path\":\"b\"}"}}]}),
+                ),
+                &finish("tool_calls"),
+                "[DONE]",
+            ],
         );
+        let second_id = got2
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::ToolCallEnd { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_ne!(ends[0].0, second_id);
     }
 
     #[test]

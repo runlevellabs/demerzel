@@ -460,7 +460,8 @@ fn judge_reply(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
         .is_some_and(|key| !key.is_empty());
-    let outcome = systemone::answer(script, authorized, &parsed);
+    let index = state.judged.load(Ordering::Relaxed) as usize;
+    let outcome = systemone::answer(script, index, authorized, &parsed);
     if !state.cycle {
         record(state, path, headers, parsed);
     }

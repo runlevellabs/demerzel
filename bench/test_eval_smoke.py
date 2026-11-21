@@ -289,6 +289,48 @@ class RunTests(SmokeTestCase):
         config = tomllib.loads((path / "demerzel" / "config.toml").read_text())
         self.assertEqual(config["providers"][smoke.JUDGE_INSTANCE]["model"], model)
 
+    def test_judge_checks_and_rules_write_into_config(self):
+        path = self.tmp / "config-home-rules"
+        path.mkdir()
+        judge = dict(
+            JUDGE,
+            checks={"approval": "act", "outcome": "note", "progress": "off"},
+            rules=[
+                {
+                    "event": "tool_before",
+                    "tool": "bash",
+                    "ask": "Does this command touch protected files?",
+                    "action": "deny",
+                    "threshold": 0.75,
+                    "reason": "protected path",
+                },
+                {
+                    "event": "turn_end",
+                    "ask": "Did the reply skip verification?",
+                    "action": "warn",
+                },
+            ],
+        )
+        smoke.write_config(path, MOCK_URL, judge)
+        config = tomllib.loads((path / "demerzel" / "config.toml").read_text())
+        self.assertEqual(
+            config["judgments"]["checks"],
+            {"approval": "act", "outcome": "note", "progress": "off"},
+        )
+        self.assertEqual(len(config["judgments"]["rules"]), 2)
+        self.assertEqual(config["judgments"]["rules"][0]["action"], "deny")
+        self.assertEqual(config["judgments"]["rules"][0]["threshold"], 0.75)
+        self.assertEqual(config["judgments"]["rules"][0]["reason"], "protected path")
+        self.assertEqual(config["judgments"]["rules"][1]["event"], "turn_end")
+
+    def test_judge_check_keys_with_special_chars_are_quoted_in_toml(self):
+        path = self.tmp / "config-home-quoted"
+        path.mkdir()
+        judge = dict(JUDGE, checks={"weird key.name": "log"})
+        smoke.write_config(path, MOCK_URL, judge)
+        config = tomllib.loads((path / "demerzel" / "config.toml").read_text())
+        self.assertEqual(config["judgments"]["checks"]["weird key.name"], "log")
+
     def test_mock_without_a_url_fails_without_a_hang(self):
         for mode in ("silent", "garbage", "exit"):
             with self.subTest(mode=mode):
@@ -545,7 +587,14 @@ class ValidationTests(SmokeTestCase):
         score = {"type": "score", "score": 0.5, "confidence": 0.5,
                  "probabilities": {"0": 0.5, "1": 0.5}, "legend": {"0": "low", "1": "high"}}
         choice = {"type": "choice", "choice": "fix", "confidence": 0.5, "probabilities": {"fix": 1}}
-        valid = dict(JUDGE, requests=0, answers=dict(JUDGE["answers"], risk=score, kind=choice))
+        valid = dict(
+            JUDGE,
+            requests=0,
+            answers=dict(JUDGE["answers"], risk=score, kind=choice),
+            sequence=[{"outcome": {"type": "noul", "noul": 0.9}}],
+            checks={"outcome": "note", "claim": "warn"},
+            rules=[{"event": "tool_before", "ask": "Touch auth?", "action": "deny", "reason": "no"}],
+        )
         write_json(self.tasks / "one" / "transcript.json", dict(TRANSCRIPT, judge=valid))
         self.assertEqual(self.check(self.tasks), 0)
         noul = JUDGE["answers"]["outcome"]
@@ -567,6 +616,19 @@ class ValidationTests(SmokeTestCase):
             "answer not a number": dict(JUDGE, answers={"outcome": dict(noul, noul="0.5")}),
             "score level gap": dict(JUDGE, answers={"risk": dict(score, probabilities={"0": 0.5, "2": 0.5})}),
             "score legend short": dict(JUDGE, answers={"risk": dict(score, legend={"0": "low"})}),
+            "sequence not a list": dict(JUDGE, sequence={}),
+            "sequence item not an object": dict(JUDGE, sequence=["bad"]),
+            "sequence bad answer": dict(JUDGE, sequence=[{"outcome": {"type": "bogus"}}]),
+            "checks not an object": dict(JUDGE, checks=[]),
+            "checks non-string value": dict(JUDGE, checks={"outcome": 1}),
+            "rules not a list": dict(JUDGE, rules={}),
+            "rule missing ask": dict(JUDGE, rules=[{"event": "tool_before", "action": "deny"}]),
+            "rule unknown field": dict(JUDGE, rules=[{"event": "tool_before", "ask": "q", "action": "deny", "extra": 1}]),
+            "rule bad threshold": dict(JUDGE, rules=[{"event": "tool_before", "ask": "q", "action": "deny", "threshold": "high"}]),
+            "rule zero threshold": dict(JUDGE, rules=[{"event": "tool_before", "ask": "q", "action": "deny", "threshold": 0}]),
+            "rule one threshold": dict(JUDGE, rules=[{"event": "tool_before", "ask": "q", "action": "deny", "threshold": 1.0}]),
+            "rule negative threshold": dict(JUDGE, rules=[{"event": "tool_before", "ask": "q", "action": "deny", "threshold": -0.2}]),
+            "rule above-one threshold": dict(JUDGE, rules=[{"event": "tool_before", "ask": "q", "action": "deny", "threshold": 1.2}]),
         }
         for label, judge in shapes.items():
             with self.subTest(shape=label):

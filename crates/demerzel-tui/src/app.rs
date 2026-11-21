@@ -559,6 +559,15 @@ impl App {
                 }
                 self.transcript.replay(replay);
             }
+            DisplayEvent::Judgment {
+                call_id,
+                source,
+                action,
+                text,
+            } => {
+                self.transcript
+                    .tool_judgment(call_id.as_deref(), &source, &action, &text);
+            }
             DisplayEvent::Notice(text) => self.transcript.push_line(Kind::Notice, &text),
             DisplayEvent::Error(text) => self.transcript.push_line(Kind::Error, &text),
             DisplayEvent::Status(patch) => self.status.apply(patch),

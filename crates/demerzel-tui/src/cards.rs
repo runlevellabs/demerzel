@@ -132,6 +132,18 @@ pub struct Outcome<'a> {
     pub at: Instant,
 }
 
+/// Maximum judgment findings kept on one card. Excess findings are
+/// summarized in one trailing line so a card stays bounded.
+const MAX_CARD_JUDGMENTS: usize = 8;
+
+/// Visual tone for a judgment finding line on a card.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JudgmentTone {
+    Deny,
+    Warn,
+    Allow,
+}
+
 /// One tool call on the screen.
 #[derive(Debug)]
 pub struct Card {
@@ -142,6 +154,10 @@ pub struct Card {
     /// The preview past its first line, or the question's own
     /// preview whole.
     body: Option<String>,
+    /// Judgment findings attached to this card, capped at
+    /// `MAX_CARD_JUDGMENTS`.
+    judgments: Vec<(String, JudgmentTone)>,
+    judgments_dropped: usize,
     started: Option<Instant>,
     duration: Option<Duration>,
     summary: Option<String>,
@@ -153,8 +169,10 @@ pub struct Card {
     /// The text needs a render before the next layout.
     stale: bool,
     /// Byte offsets from the last render, for the faces: the header
-    /// end, the output span, and the start of the footer's hint.
+    /// end, each judgment span, the output span, and the start of the
+    /// footer's hint.
     header_end: usize,
+    judgment_spans: Vec<(usize, usize, JudgmentTone)>,
     output_span: (usize, usize),
     hint_start: usize,
 }
@@ -166,6 +184,8 @@ impl Card {
             state: State::Running,
             input: None,
             body: None,
+            judgments: Vec::new(),
+            judgments_dropped: 0,
             started: None,
             duration: None,
             summary: None,
@@ -175,6 +195,7 @@ impl Card {
             expanded,
             stale: true,
             header_end: 0,
+            judgment_spans: Vec::new(),
             output_span: (0, 0),
             hint_start: 0,
         }
@@ -290,12 +311,34 @@ impl Card {
         }
     }
 
+    /// Attach a judgment finding to this card, sanitized to one line
+    /// and bounded at `MAX_CARD_JUDGMENTS`.
+    pub fn add_judgment(&mut self, source: &str, action: &str, text: &str) {
+        if self.judgments.len() >= MAX_CARD_JUDGMENTS {
+            self.judgments_dropped += 1;
+            self.stale = true;
+            return;
+        }
+        let source = one_line(source, PROGRESS_NAME_BYTES);
+        let action = one_line(action, PROGRESS_NAME_BYTES);
+        let text = one_line(text, LINE_BYTES);
+        let tone = match action.as_str() {
+            "deny" => JudgmentTone::Deny,
+            "allow" => JudgmentTone::Allow,
+            _ => JudgmentTone::Warn,
+        };
+        let line = format!("! {source} ({action}): {text}");
+        self.judgments.push((line, tone));
+        self.stale = true;
+    }
+
     /// Render the card into `out`, replacing its content, and mark
     /// it fresh. The output rows stop under `cap`, less the footer,
     /// so the footer always lands.
     pub fn render(&mut self, out: &mut String, cap: usize) {
         self.stale = false;
         out.clear();
+        self.judgment_spans.clear();
         out.push(self.state.glyph());
         out.push(' ');
         out.push_str(&self.name);
@@ -307,6 +350,31 @@ impl Card {
         if let Some(body) = &self.body {
             for line in body.lines() {
                 push_indented(out, line);
+            }
+        }
+        let judgment_budget = cap.saturating_sub(FOOTER_RESERVE);
+        let mut skipped_for_cap = 0usize;
+        for (line, tone) in &self.judgments {
+            if out.len() + 1 + INDENT.len() + line.len() > judgment_budget {
+                skipped_for_cap += 1;
+                continue;
+            }
+            out.push('\n');
+            out.push_str(INDENT);
+            let start = out.len();
+            out.push_str(line);
+            self.judgment_spans.push((start, out.len(), *tone));
+        }
+        let omitted = self.judgments_dropped + skipped_for_cap;
+        if omitted > 0 {
+            let note = format!("… {omitted} more judgment finding(s) omitted");
+            if out.len() + 1 + INDENT.len() + note.len() <= judgment_budget {
+                out.push('\n');
+                out.push_str(INDENT);
+                let start = out.len();
+                out.push_str(&note);
+                self.judgment_spans
+                    .push((start, out.len(), JudgmentTone::Allow));
             }
         }
 
@@ -418,6 +486,18 @@ impl Card {
                 out.push((start as u32, face));
                 out.push((at.min(len) as u32, Face::PLAIN));
             }
+        }
+        for &(start, end, tone) in &self.judgment_spans {
+            if start >= len {
+                break;
+            }
+            let face = match tone {
+                JudgmentTone::Deny => Face::FAILURE,
+                JudgmentTone::Warn => Face::WARNING,
+                JudgmentTone::Allow => Face::MUTED,
+            };
+            out.push((start as u32, face));
+            out.push((end.min(len) as u32, Face::PLAIN));
         }
         let (start, end) = (self.output_span.0.min(len), self.output_span.1.min(len));
         if end > start {
@@ -1028,5 +1108,47 @@ mod tests {
             progress_text(Duration::from_secs(65), "bash"),
             "⠋ 1m 05s · bash"
         );
+    }
+
+    #[test]
+    fn judgment_findings_render_on_pending_and_finished_cards() {
+        let mut card = Card::new("bash", false);
+        card.set_preview("$ rm -rf build");
+        card.run(Instant::now());
+        card.add_judgment("approval", "warn", "destructive call (probability 0.92)");
+        card.pending(None);
+        let shown = text(&mut card);
+        assert!(
+            shown.contains("! approval (warn): destructive call (probability 0.92)"),
+            "{shown}"
+        );
+        let mut faces = Vec::new();
+        card.faces(shown.len(), &mut faces);
+        assert!(faces.iter().any(|&(_, face)| face == Face::WARNING));
+
+        let mut denied = Card::new("bash", false);
+        denied.add_judgment("rule.0", "deny", "src/auth/ is off limits");
+        let shown = text(&mut denied);
+        let mut faces = Vec::new();
+        denied.faces(shown.len(), &mut faces);
+        assert!(faces.iter().any(|&(_, face)| face == Face::FAILURE));
+
+        // Auto-allow findings use calm dim face, not warning.
+        let mut allowed = Card::new("bash", false);
+        allowed.add_judgment("approval", "allow", "approved by judge");
+        let shown = text(&mut allowed);
+        let mut faces = Vec::new();
+        allowed.faces(shown.len(), &mut faces);
+        assert!(faces.iter().any(|&(_, face)| face == Face::MUTED));
+        assert!(!faces.iter().any(|&(_, face)| face == Face::WARNING));
+
+        // Findings beyond MAX_CARD_JUDGMENTS are bounded and stay within cap.
+        let mut flooded = Card::new("bash", false);
+        for i in 0..20 {
+            flooded.add_judgment(&format!("rule.{i}"), "warn", &"x".repeat(400));
+        }
+        let mut out = String::new();
+        flooded.render(&mut out, 1024);
+        assert!(out.len() <= 1024, "rendered {} bytes", out.len());
     }
 }

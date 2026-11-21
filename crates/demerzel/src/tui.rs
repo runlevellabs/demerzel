@@ -226,6 +226,7 @@ impl Driver for TuiDriver<'_> {
             Some(Effect::NewSession) => {
                 self.engine = None;
                 self.resume = Resume::Fresh;
+                self.runtime.clear_judgments_session();
                 events.session_changed();
                 return Submission::Note(NEW_SESSION_NOTE.to_string());
             }
@@ -235,6 +236,9 @@ impl Driver for TuiDriver<'_> {
                     .as_ref()
                     .map(|engine| (engine.session().id(), engine.session().path()));
                 return Submission::Note(session_note(session));
+            }
+            Some(Effect::Judgments) => {
+                return Submission::Note(self.runtime.judgments_note());
             }
             Some(Effect::SetModel(name)) => {
                 if let Some(engine) = self.engine.as_mut()

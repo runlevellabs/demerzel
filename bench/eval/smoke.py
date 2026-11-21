@@ -60,6 +60,9 @@ TRANSCRIPT_FIELDS = frozenset({"schema", "replies"})
 TRANSCRIPT_OPTIONAL = frozenset({"judge"})
 CALL_FIELDS = frozenset({"id", "name", "input"})
 JUDGE_FIELDS = frozenset({"model", "requests", "answers"})
+JUDGE_OPTIONAL = frozenset({"sequence", "checks", "rules"})
+RULE_FIELDS = frozenset({"event", "ask", "action"})
+RULE_OPTIONAL = frozenset({"tool", "threshold", "reason"})
 # The members of each wire answer type of the judge route.
 ANSWER_FIELDS = {
     "noul": frozenset({"type", "noul"}),
@@ -312,16 +315,51 @@ def check_transcript(path: Path) -> tuple[int, dict | None]:
 
 def check_judge(where: str, judge) -> None:
     """The judge member: the reply model, the expected number of judge
-    requests, and one wire answer per question id."""
-    check_fields(where, judge, JUDGE_FIELDS)
+    requests, one wire answer per question id, and optional per-request
+    overrides, check overrides, and rules."""
+    check_fields(where, judge, JUDGE_FIELDS, JUDGE_OPTIONAL)
     check_text(f"{where}.model", judge["model"])
     if type(judge["requests"]) is not int or judge["requests"] < 0:
         raise InvalidTask(f"{where}.requests: expected a non-negative integer")
     answers = judge["answers"]
-    if not isinstance(answers, dict) or not answers:
+    if not isinstance(answers, dict) or (not answers and not judge.get("sequence")):
         raise InvalidTask(f"{where}.answers: expected a non-empty object")
     for question, answer in answers.items():
         check_answer(f"{where}.answers.{question}", answer)
+    if "sequence" in judge:
+        sequence = judge["sequence"]
+        if not isinstance(sequence, list):
+            raise InvalidTask(f"{where}.sequence: expected a list of answer objects")
+        for index, step in enumerate(sequence):
+            step_where = f"{where}.sequence[{index}]"
+            if not isinstance(step, dict):
+                raise InvalidTask(f"{step_where}: expected a JSON object")
+            for question, answer in step.items():
+                check_answer(f"{step_where}.{question}", answer)
+    if "checks" in judge:
+        checks = judge["checks"]
+        if not isinstance(checks, dict):
+            raise InvalidTask(f"{where}.checks: expected a JSON object")
+        for name, action in checks.items():
+            check_text(f"{where}.checks.{name}", action)
+    if "rules" in judge:
+        rules = judge["rules"]
+        if not isinstance(rules, list):
+            raise InvalidTask(f"{where}.rules: expected a list of rule objects")
+        for index, rule in enumerate(rules):
+            rule_where = f"{where}.rules[{index}]"
+            check_fields(rule_where, rule, RULE_FIELDS, RULE_OPTIONAL)
+            check_text(f"{rule_where}.event", rule["event"])
+            check_text(f"{rule_where}.ask", rule["ask"])
+            check_text(f"{rule_where}.action", rule["action"])
+            if "tool" in rule:
+                check_text(f"{rule_where}.tool", rule["tool"])
+            if "reason" in rule:
+                check_text(f"{rule_where}.reason", rule["reason"])
+            if "threshold" in rule:
+                check_number(f"{rule_where}.threshold", rule["threshold"])
+                if not (0 < rule["threshold"] < 1):
+                    raise InvalidTask(f"{rule_where}.threshold: expected a number strictly between 0 and 1")
 
 
 def check_answer(where: str, answer) -> None:
@@ -536,6 +574,22 @@ def write_config(config_home: Path, url: str, judge: dict | None = None) -> None
             f"\n[judgments]\n"
             f"instance = {json.dumps(JUDGE_INSTANCE)}\n"
         )
+        checks = judge.get("checks") or {}
+        if checks:
+            text += "\n[judgments.checks]\n"
+            for name, action in sorted(checks.items()):
+                text += f"{toml_string(name)} = {toml_string(action)}\n"
+        for rule in judge.get("rules") or []:
+            text += "\n[[judgments.rules]]\n"
+            text += f"event = {toml_string(rule['event'])}\n"
+            if "tool" in rule:
+                text += f"tool = {toml_string(rule['tool'])}\n"
+            text += f"ask = {toml_string(rule['ask'])}\n"
+            if "threshold" in rule:
+                text += f"threshold = {rule['threshold']}\n"
+            text += f"action = {toml_string(rule['action'])}\n"
+            if "reason" in rule:
+                text += f"reason = {toml_string(rule['reason'])}\n"
     (directory / "config.toml").write_text(text, encoding="utf-8")
 
 

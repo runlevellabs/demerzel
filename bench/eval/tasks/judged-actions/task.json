@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "prompt": "Try touching protected.txt, then create ok.txt and run check.sh.",
+  "oracle": [
+    "sh",
+    "-c",
+    "diff -r . \"$DEMERZEL_EVAL_TASK_DIR/expected\" && python3 -I \"$DEMERZEL_EVAL_TASK_DIR/verify.py\""
+  ]
+}

@@ -82,7 +82,18 @@ struct Document {
 struct JudgeDoc {
     model: String,
     requests: u64,
+    #[serde(default)]
     answers: BTreeMap<String, Value>,
+    #[serde(default)]
+    sequence: Vec<BTreeMap<String, Value>>,
+    /// Optional check overrides and rules read by the smoke runner;
+    /// accepted here so the mock validates the same schema 1 document.
+    #[serde(default)]
+    #[allow(dead_code)]
+    checks: BTreeMap<String, String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    rules: Vec<Value>,
 }
 
 #[derive(Deserialize)]
@@ -174,7 +185,7 @@ fn judge(value: Value) -> Result<TranscriptJudge, String> {
     if doc.model.is_empty() {
         return Err("model is empty".to_string());
     }
-    if doc.answers.is_empty() {
+    if doc.answers.is_empty() && doc.sequence.is_empty() {
         return Err("answers is empty".to_string());
     }
     let answers = doc
@@ -185,10 +196,24 @@ fn judge(value: Value) -> Result<TranscriptJudge, String> {
             Err(reason) => Err(format!("answers.{id}: {reason}")),
         })
         .collect::<Result<_, String>>()?;
+    let sequence = doc
+        .sequence
+        .into_iter()
+        .enumerate()
+        .map(|(step_index, map)| {
+            map.into_iter()
+                .map(|(id, value)| match wire_answer(&value) {
+                    Ok(answer) => Ok((id, answer)),
+                    Err(reason) => Err(format!("sequence[{step_index}].{id}: {reason}")),
+                })
+                .collect::<Result<BTreeMap<_, _>, String>>()
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     Ok(TranscriptJudge {
         script: JudgeScript {
             model: doc.model,
             answers,
+            sequence,
         },
         requests: doc.requests,
     })

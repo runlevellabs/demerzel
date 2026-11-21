@@ -37,6 +37,10 @@ const COMMANDS: &[Command] = &[
         help: "show or set the approval mode: read-only, ask, auto",
     },
     Command {
+        usage: "/judgments",
+        help: "show the judge, checks, rules, and session counts",
+    },
+    Command {
         usage: "/new",
         help: "start a fresh session at the next prompt",
     },
@@ -179,6 +183,8 @@ pub(crate) enum Effect {
     NewSession,
     /// Show the open session's id and file.
     Session,
+    /// Show the configured judge, checks, rules, and session counts.
+    Judgments,
     /// Switch the head target's model.
     SetModel(String),
     /// Switch the head target's provider instance and model.
@@ -215,6 +221,13 @@ pub(crate) fn dispatch(
         "help" => Effect::Note(help_text()),
         "new" => Effect::NewSession,
         "session" => Effect::Session,
+        "judgments" => {
+            if args.is_empty() {
+                Effect::Judgments
+            } else {
+                Effect::Note("usage: /judgments".to_string())
+            }
+        }
         "model" => {
             // Two probes decide the shape; a pasted flood of tokens
             // must not build a vector of itself.
@@ -337,6 +350,20 @@ mod tests {
             ),
             Some(Effect::Session)
         ));
+        assert!(matches!(
+            dispatch(
+                "/judgments",
+                &settings("m", Effort::Medium, ApprovalMode::Ask)
+            ),
+            Some(Effect::Judgments)
+        ));
+        let Some(Effect::Note(note)) = dispatch(
+            "/judgments extra",
+            &settings("m", Effort::Medium, ApprovalMode::Ask),
+        ) else {
+            panic!("expected usage for /judgments with args");
+        };
+        assert!(note.starts_with("usage: /judgments"), "{note}");
         assert!(
             dispatch(
                 "not a command",

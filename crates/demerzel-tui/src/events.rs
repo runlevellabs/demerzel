@@ -51,6 +51,13 @@ pub(crate) enum DisplayEvent {
         at: Instant,
     },
     Usage(Usage),
+    /// A judgment check or rule fired with a user-visible action.
+    Judgment {
+        call_id: Option<String>,
+        source: String,
+        action: String,
+        text: String,
+    },
     Notice(String),
     Error(String),
     /// A status patch: the segments it names change.
@@ -180,6 +187,18 @@ impl EventSink for EventSender {
                 }
             }
             EngineEvent::ModelUsage(usage) => DisplayEvent::Usage(usage),
+            EngineEvent::Judgment {
+                call_id,
+                source,
+                action,
+                text,
+                ..
+            } => DisplayEvent::Judgment {
+                call_id: call_id.map(str::to_string),
+                source: source.to_string(),
+                action: action.to_string(),
+                text: text.to_string(),
+            },
             _ => return,
         };
         let _ = self.tx.send(owned);

@@ -23,6 +23,23 @@ pub use demerzel_core::{
     ToolDefinition,
 };
 
+/// An 8-hex-character random nonce for synthesized tool-call ids when a
+/// compatible server omits `id` / `call_id`, so made-up ids stay unique
+/// across turns and resumes.
+pub(crate) fn random_call_nonce() -> String {
+    let mut bytes = [0u8; 4];
+    if getrandom::fill(&mut bytes).is_err() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as u32);
+        bytes = nanos.to_be_bytes();
+    }
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3]
+    )
+}
+
 /// The adapter ids this build ships: the values of a provider
 /// instance's `kind`, model adapters and judge backends alike. A
 /// slice, so a new adapter never changes the item's type.

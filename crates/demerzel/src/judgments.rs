@@ -1,17 +1,15 @@
 //! Judgments: the run's judge beside the loop.
 //!
-//! A [`Host`] sits on each session's engine. At each loop event it
-//! filters the built-in checks, builds the state of the event, and
-//! spawns one task that sends every question of the event in one
-//! request and writes one `judgment` record. The host returns at once
-//! and keeps every decision: in this step each check runs at `log`,
-//! so a judge that is slow, failing, or absent never delays or changes
-//! a turn.
+//! A `Host` sits on each session's engine. At each loop event it
+//! filters the built-in checks and matching rules, builds the state
+//! of the event, sends one request for all questions of the event,
+//! writes one `judgment` record, and applies configured actions
+//! (`log`, `warn`, `note`, `act`, or rule `deny`).
 //!
-//! On the turn's path: the filters, a look at the call cap, the state
-//! build, and one spawn. In the task: the judge build at the first
-//! check, the wait for one of the run's request permits, the call cap,
-//! the questions, the request, the state hash, and the record.
+//! Checks at `log` and `tool_after` `warn` run asynchronously beside
+//! the turn. Blocking checks (`tool_before` above `log`, `tool_after`
+//! `note`, and `turn_end` `warn`) await the judge within its timeout
+//! and leave the policy decision unchanged on timeout or failure.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -22,20 +20,20 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 use demerzel_core::{
-    ApprovalDecision, ApprovalMode, BoxFuture, CallSeen, HostReply, Judge, JudgeError,
-    JudgeRequest, JudgmentRecord, LoopHost, ProviderError, Question, SessionWriter, ToolAccess,
-    ToolAfter, ToolBefore, ToolGate, TurnEnd, TurnEndOutcome, TurnOutcome, TurnStart,
+    Answer, ApprovalDecision, ApprovalMode, BoxFuture, CallSeen, Finding, HostReply, Judge,
+    JudgeError, JudgeReply, JudgeRequest, JudgmentRecord, JudgmentRuleRecord, LoopHost,
+    ProviderError, Question, SessionWriter, ToolAccess, ToolAfter, ToolBefore, ToolGate, TurnEnd,
+    TurnEndOutcome, TurnOutcome, TurnStart,
 };
 use demerzel_providers::typesafe::{self, TypeSafeConfig, TypeSafeJudge};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 
-use crate::config::{self, Check, CheckAction, Checks};
+use crate::config::{self, Check, CheckAction, Checks, Rule, RuleAction, RuleEvent};
 use crate::{AuthPaths, RunError};
 
-/// The budget of one judge request, retries included. A turn never
-/// waits for it.
+/// The budget of one judge request, retries included.
 pub(crate) const TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The judge requests one run sends at the same time, over all its
@@ -47,19 +45,124 @@ pub(crate) const MAX_IN_FLIGHT: usize = 8;
 /// the last record's write.
 const SETTLE_GRACE: Duration = Duration::from_millis(250);
 
+/// Cap on `busy` records written by one session when the judge is
+/// stalled, so a long turn cannot flood the session file without
+/// counting against `max_calls`.
+const BUSY_RECORD_CAP: u32 = 32;
+
 /// The `error` of a record whose request waited too long for a permit
 /// and sent nothing.
 pub(crate) const BUSY: &str = "busy";
 /// The `error` of a record whose request had no answer in time.
 pub(crate) const TIMED_OUT: &str = "timeout";
 
+/// The built-in firing threshold for `outcome`, `progress`, and `claim`.
+pub const CHECK_THRESHOLD: f64 = 0.8;
+/// Maximum destructive probability for an `ask`-mode judge approval.
+pub const APPROVAL_ASK_MAX_DESTRUCTIVE: f64 = 0.05;
+/// Minimum in-scope probability for an `ask`-mode judge approval.
+pub const APPROVAL_ASK_MIN_IN_SCOPE: f64 = 0.9;
+/// Minimum destructive probability for an `auto`-mode judge escalation.
+pub const APPROVAL_AUTO_MIN_DESTRUCTIVE: f64 = 0.5;
+
 /// The question ids. They stay in code; the records key the answers
 /// by them.
-pub(crate) const APPROVAL_DESTRUCTIVE: &str = "approval.destructive";
-pub(crate) const APPROVAL_IN_SCOPE: &str = "approval.in_scope";
-pub(crate) const OUTCOME: &str = "outcome";
-pub(crate) const PROGRESS: &str = "progress";
-pub(crate) const CLAIM: &str = "claim";
+pub const APPROVAL_DESTRUCTIVE: &str = "approval.destructive";
+pub const APPROVAL_IN_SCOPE: &str = "approval.in_scope";
+pub const OUTCOME: &str = "outcome";
+pub const PROGRESS: &str = "progress";
+pub const CLAIM: &str = "claim";
+
+/// Whether `ask`-mode `approval = "act"` removes the approval prompt.
+pub fn approval_ask_allows(destructive: f64, in_scope: f64) -> bool {
+    destructive <= APPROVAL_ASK_MAX_DESTRUCTIVE && in_scope >= APPROVAL_ASK_MIN_IN_SCOPE
+}
+
+/// Whether `auto`-mode `approval = "act"` escalates a call to an approval prompt.
+pub fn approval_auto_asks(destructive: f64) -> bool {
+    destructive >= APPROVAL_AUTO_MIN_DESTRUCTIVE
+}
+
+/// Whether a built-in `outcome`, `progress`, or `claim` check fires.
+pub fn check_fires(yes: f64) -> bool {
+    yes >= CHECK_THRESHOLD
+}
+
+/// Build the approval-check state text using the exact production state builder.
+pub fn approval_state(prompt: &str, tool: &str, input: &Value, calls: &[(&str, bool)]) -> String {
+    build_state(&StateParts {
+        prompt,
+        tool: Some(tool),
+        input: Some(input),
+        calls,
+        ..StateParts::default()
+    })
+}
+
+/// Build the `outcome`-check state text using the exact production state builder.
+pub fn outcome_state(
+    prompt: &str,
+    tool: &str,
+    input: &Value,
+    output: &str,
+    calls: &[(&str, bool)],
+) -> String {
+    build_state(&StateParts {
+        prompt,
+        tool: Some(tool),
+        input: Some(input),
+        output: Some(output),
+        calls,
+        ..StateParts::default()
+    })
+}
+
+/// Build the `progress`-check state text using the exact production state builder.
+pub fn progress_state(
+    prompt: &str,
+    tool: &str,
+    input: &Value,
+    earlier_failed_input: &Value,
+    output: &str,
+    calls: &[(&str, bool)],
+) -> String {
+    let earlier = JsonHead::new(earlier_failed_input, INPUT_CAP);
+    build_state(&StateParts {
+        prompt,
+        tool: Some(tool),
+        input: Some(input),
+        earlier_failed_input: Some(&earlier),
+        output: Some(output),
+        calls,
+        ..StateParts::default()
+    })
+}
+
+/// Build the `claim`-check state text using the exact production state builder.
+pub fn claim_state(
+    prompt: &str,
+    last_output: &str,
+    calls: &[(&str, bool)],
+    final_message: &str,
+) -> String {
+    build_state(&StateParts {
+        prompt,
+        output: Some(last_output),
+        calls,
+        final_message: Some(final_message),
+        ..StateParts::default()
+    })
+}
+
+/// The production approval-check questions.
+pub fn approval_questions() -> BTreeMap<String, Question> {
+    questions(&[Check::Approval], &[], &[])
+}
+
+/// The production questions for a set of built-in checks.
+pub fn check_questions(checks: &[Check]) -> BTreeMap<String, Question> {
+    questions(checks, &[], &[])
+}
 
 /// The question texts. The wording is not contract.
 const APPROVAL_DESTRUCTIVE_TEXT: &str = "Is this tool call destructive or hard to undo? \
@@ -117,6 +220,9 @@ pub(crate) struct Judging {
 struct Shared {
     judge: JudgeSlot,
     checks: Checks,
+    rules: Vec<Rule>,
+    /// True when any configured check or rule acts above `log`.
+    acts_above_log: bool,
     max_calls: u32,
     /// The request timeout; [`TIMEOUT`] outside tests.
     timeout: Duration,
@@ -124,6 +230,8 @@ struct Shared {
     permits: Arc<Semaphore>,
     flight: Arc<Flight>,
     notices: Mutex<Vec<String>>,
+    /// The latest opened session's state, for `/judgments`.
+    latest_session: Mutex<Option<Arc<SessionState>>>,
     /// The tasks the hosts spawned, for tests.
     #[cfg(test)]
     spawned: AtomicUsize,
@@ -231,6 +339,32 @@ impl Budget {
     }
 }
 
+/// Live counters for one opened session, shown by `/judgments`.
+#[derive(Default)]
+struct SessionStats {
+    fired_warn: AtomicU32,
+    fired_note: AtomicU32,
+    fired_allow: AtomicU32,
+    fired_ask: AtomicU32,
+    fired_deny: AtomicU32,
+    errors: AtomicU32,
+    timeouts: AtomicU32,
+    busy: AtomicU32,
+}
+
+impl SessionStats {
+    fn record_fired(&self, action: &str) {
+        match action {
+            "warn" => self.fired_warn.fetch_add(1, Ordering::Relaxed),
+            "note" => self.fired_note.fetch_add(1, Ordering::Relaxed),
+            "allow" => self.fired_allow.fetch_add(1, Ordering::Relaxed),
+            "ask" => self.fired_ask.fetch_add(1, Ordering::Relaxed),
+            "deny" => self.fired_deny.fetch_add(1, Ordering::Relaxed),
+            _ => 0,
+        };
+    }
+}
+
 /// What a host and its tasks share for one session.
 struct SessionState {
     budget: Arc<Budget>,
@@ -242,23 +376,93 @@ struct SessionState {
     /// Set once the session's notice for a judge that does not build
     /// went out.
     build_noticed: AtomicBool,
+    /// Set once the session's notice for a transport error or timeout
+    /// went out (only when a check or rule acts above `log`).
+    transport_noticed: AtomicBool,
+    /// Set once the session's notice for hitting the `busy` cap went out.
+    busy_noticed: AtomicBool,
+    /// Fast-path flag so `take_findings()` avoids locking on every
+    /// streaming event when no async finding is queued.
+    has_findings: AtomicBool,
+    /// Async findings from `tool_after` `warn` tasks, drained by the engine.
+    findings: Mutex<Vec<Finding>>,
+    /// In-flight `tool_after` `warn` task handles for the current turn,
+    /// awaited at `turn_end` if still running.
+    pending_warns: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    stats: SessionStats,
+}
+
+impl SessionState {
+    fn push_findings(&self, mut findings: Vec<Finding>) {
+        if findings.is_empty() {
+            return;
+        }
+        let mut queue = self.findings.lock().unwrap_or_else(PoisonError::into_inner);
+        queue.append(&mut findings);
+        self.has_findings.store(true, Ordering::Release);
+    }
+
+    fn take_findings(&self) -> Vec<Finding> {
+        if !self.has_findings.load(Ordering::Acquire) {
+            return Vec::new();
+        }
+        let mut queue = self.findings.lock().unwrap_or_else(PoisonError::into_inner);
+        self.has_findings.store(false, Ordering::Release);
+        std::mem::take(&mut *queue)
+    }
+
+    fn push_pending_warn(&self, handle: tokio::task::JoinHandle<()>) {
+        let mut warns = self
+            .pending_warns
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        warns.retain(|h| !h.is_finished());
+        warns.push(handle);
+    }
+
+    fn take_pending_warns(&self) -> Vec<tokio::task::JoinHandle<()>> {
+        std::mem::take(
+            &mut *self
+                .pending_warns
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        )
+    }
+
+    fn note_transport_failure(&self, shared: &Shared, error: &str) {
+        if shared.acts_above_log && !self.transport_noticed.swap(true, Ordering::AcqRel) {
+            shared.notice(format!(
+                "judgments: judge `{}` failed ({error}); checks fall back to the approval \
+                 policy (DEMERZEL_LOG=warn logs each failure)",
+                shared.judge.instance.name
+            ));
+        }
+    }
 }
 
 impl Judging {
     /// The judgments of a run over `instance`, the judge instance.
-    /// `None` when every check is off: no host, no request.
+    /// `None` when every check is off and no rule is configured: no
+    /// host, no request.
     pub(crate) fn new(
         judgments: &config::Judgments,
         instance: config::Instance,
         auth: Option<AuthPaths>,
     ) -> Option<Self> {
         let checks = judgments.checks;
-        if Check::ALL
+        let all_off = Check::ALL
             .iter()
-            .all(|&check| checks.get(check) == CheckAction::Off)
-        {
+            .all(|&check| checks.get(check) == CheckAction::Off);
+        if all_off && judgments.rules.is_empty() {
             return None;
         }
+        let acts_above_log = Check::ALL
+            .iter()
+            .any(|&check| checks.get(check) > CheckAction::Log)
+            || judgments
+                .rules
+                .iter()
+                .any(|rule| rule.action != RuleAction::Log);
         Some(Self {
             shared: Arc::new(Shared {
                 judge: JudgeSlot {
@@ -267,11 +471,14 @@ impl Judging {
                     judge: OnceLock::new(),
                 },
                 checks,
+                rules: judgments.rules.clone(),
+                acts_above_log,
                 max_calls: judgments.max_calls,
                 timeout: TIMEOUT,
                 permits: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
                 flight: Arc::default(),
                 notices: Mutex::new(Vec::new()),
+                latest_session: Mutex::new(None),
                 #[cfg(test)]
                 spawned: AtomicUsize::new(0),
             }),
@@ -291,17 +498,115 @@ impl Judging {
     /// session's own writer, so each record lands in the file of the
     /// session that asked.
     pub(crate) fn host(&self, writer: SessionWriter) -> Host {
+        let session = Arc::new(SessionState {
+            budget: Arc::new(Budget::new(self.shared.max_calls)),
+            turn: AtomicU64::new(1),
+            build_failed: AtomicU64::new(0),
+            build_noticed: AtomicBool::new(false),
+            transport_noticed: AtomicBool::new(false),
+            busy_noticed: AtomicBool::new(false),
+            has_findings: AtomicBool::new(false),
+            findings: Mutex::new(Vec::new()),
+            pending_warns: Mutex::new(Vec::new()),
+            stats: SessionStats::default(),
+        });
+        *self
+            .shared
+            .latest_session
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&session));
         Host {
             shared: Arc::clone(&self.shared),
-            session: Arc::new(SessionState {
-                budget: Arc::new(Budget::new(self.shared.max_calls)),
-                turn: AtomicU64::new(1),
-                build_failed: AtomicU64::new(0),
-                build_noticed: AtomicBool::new(false),
-            }),
+            session,
             writer,
             calls: Mutex::new(TurnCalls::default()),
         }
+    }
+
+    /// Drop the active session stats handle (for `/new`).
+    pub(crate) fn clear_session(&self) {
+        *self
+            .shared
+            .latest_session
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
+    /// Human-readable status for `/judgments`.
+    pub(crate) fn summary(&self) -> String {
+        let shared = &self.shared;
+        let instance = &shared.judge.instance;
+        let model = instance
+            .model
+            .as_deref()
+            .or_else(|| demerzel_providers::default_model(&instance.kind))
+            .unwrap_or("unknown");
+        let mut out = format!(
+            "judgments: {} ({}, model {model})",
+            instance.name, instance.kind
+        );
+        let check_parts: Vec<String> = Check::ALL
+            .iter()
+            .map(|&check| format!("{}={}", check.as_str(), shared.checks.get(check).as_str()))
+            .collect();
+        let _ = write!(out, "\n  checks: {}", check_parts.join(", "));
+        if shared.rules.is_empty() {
+            out.push_str("\n  rules: none");
+        } else {
+            let _ = write!(out, "\n  rules ({}):", shared.rules.len());
+            for (index, rule) in shared.rules.iter().enumerate() {
+                let tool = rule
+                    .tool
+                    .as_deref()
+                    .map(|t| format!(" tool={t}"))
+                    .unwrap_or_default();
+                let _ = write!(
+                    out,
+                    "\n    rule.{index} [{}]{tool} {} (threshold {:.2}, {}): {}",
+                    rule.event, rule.action, rule.threshold, rule.origin, rule.ask
+                );
+            }
+        }
+        let session = shared
+            .latest_session
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        match session {
+            Some(session) => {
+                let used = session.budget.used.load(Ordering::Acquire);
+                let s = &session.stats;
+                let _ = write!(out, "\n  session: {used}/{} calls", shared.max_calls);
+                let fired = [
+                    ("allow", s.fired_allow.load(Ordering::Relaxed)),
+                    ("ask", s.fired_ask.load(Ordering::Relaxed)),
+                    ("deny", s.fired_deny.load(Ordering::Relaxed)),
+                    ("warn", s.fired_warn.load(Ordering::Relaxed)),
+                    ("note", s.fired_note.load(Ordering::Relaxed)),
+                ];
+                let active_fired: Vec<String> = fired
+                    .into_iter()
+                    .filter(|&(_, count)| count > 0)
+                    .map(|(name, count)| format!("{name}={count}"))
+                    .collect();
+                if !active_fired.is_empty() {
+                    let _ = write!(out, " · fired: {}", active_fired.join(", "));
+                }
+                let errors = s.errors.load(Ordering::Relaxed);
+                let timeouts = s.timeouts.load(Ordering::Relaxed);
+                let busy = s.busy.load(Ordering::Relaxed);
+                if errors > 0 || timeouts > 0 || busy > 0 {
+                    let _ = write!(
+                        out,
+                        " · failures: errors={errors}, timeouts={timeouts}, busy={busy}"
+                    );
+                }
+            }
+            None => {
+                let _ = write!(out, "\n  session: none (cap {} calls)", shared.max_calls);
+            }
+        }
+        out
     }
 
     /// The notices since the last call.
@@ -434,31 +739,26 @@ impl TurnCalls {
 }
 
 impl Host {
-    /// Send the questions of `asked` about the state that `state`
-    /// builds, beside the loop. Returns at once. At the call cap, in a
-    /// turn whose judge did not build, or outside a tokio runtime,
-    /// nothing is built or sent.
-    fn ask(
+    /// Prepare an [`Ask`] when the session is eligible to call the
+    /// judge (not build-failed this turn and budget not spent).
+    fn prepare(
         &self,
         event: &'static str,
         call: Option<(&str, &str)>,
         asked: Vec<Check>,
+        rule_ids: Vec<usize>,
         state: impl FnOnce() -> String,
-    ) {
+    ) -> Option<Ask> {
         let session = &self.session;
         let turn = session.turn.load(Ordering::Acquire);
         if session.build_failed.load(Ordering::Acquire) == turn {
-            return;
+            return None;
         }
         if session.budget.spent() {
             session.budget.notice(&self.shared);
-            return;
+            return None;
         }
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            log::warn!("judgments: no async runtime at {event}; the checks send no request");
-            return;
-        };
-        let task = Ask {
+        Some(Ask {
             shared: Arc::clone(&self.shared),
             session: Arc::clone(session),
             writer: self.writer.clone(),
@@ -467,13 +767,34 @@ impl Host {
             call_id: call.map(|(id, _)| id.to_string()),
             tool: call.map(|(_, tool)| tool.to_string()),
             asked,
+            rule_ids,
             state: state(),
             spawned: Instant::now(),
             _guard: self.shared.flight.enter(),
+        })
+    }
+
+    /// Spawn a background log-only ask task.
+    fn spawn_log(
+        &self,
+        event: &'static str,
+        call: Option<(&str, &str)>,
+        asked: Vec<Check>,
+        rule_ids: Vec<usize>,
+        state: impl FnOnce() -> String,
+    ) {
+        let Some(task) = self.prepare(event, call, asked, rule_ids, state) else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            log::warn!("judgments: no async runtime at {event}; the checks send no request");
+            return;
         };
         #[cfg(test)]
         self.shared.spawned.fetch_add(1, Ordering::Relaxed);
-        runtime.spawn(task.run());
+        runtime.spawn(async move {
+            let _ = task.execute(BTreeMap::new()).await;
+        });
     }
 
     fn calls(&self) -> std::sync::MutexGuard<'_, TurnCalls> {
@@ -485,107 +806,325 @@ impl LoopHost for Host {
     fn turn_start<'a>(&'a self, _event: &'a TurnStart<'a>) -> BoxFuture<'a, HostReply> {
         self.session.turn.fetch_add(1, Ordering::AcqRel);
         *self.calls() = TurnCalls::default();
+        self.session.take_findings();
+        // Abort any leftover warn tasks from a previously cancelled turn
+        // so they do not keep occupying judge permits.
+        for handle in self.session.take_pending_warns() {
+            handle.abort();
+        }
         Box::pin(std::future::ready(HostReply::default()))
     }
 
     fn tool_before<'a>(&'a self, event: &'a ToolBefore<'a>) -> BoxFuture<'a, ToolGate> {
-        if self.shared.checks.approval != CheckAction::Off
-            && approval_applies(event.access, event.mode, event.decision)
-        {
-            self.ask(
+        // In `read-only` mode (or any policy refusal), the policy
+        // refuses the call before any judgment.
+        if event.decision == ApprovalDecision::Deny {
+            return Box::pin(std::future::ready(ToolGate::keep(event.decision)));
+        }
+        let checks = &self.shared.checks;
+        let run_approval = checks.approval != CheckAction::Off
+            && approval_applies(event.access, event.mode, event.decision);
+        let rule_ids = matching_rules(&self.shared.rules, RuleEvent::ToolBefore, Some(event.tool));
+        if !run_approval && rule_ids.is_empty() {
+            return Box::pin(std::future::ready(ToolGate::keep(event.decision)));
+        }
+        let mut asked = Vec::with_capacity(1);
+        if run_approval {
+            asked.push(Check::Approval);
+        }
+        let blocking = (run_approval && checks.approval > CheckAction::Log)
+            || rule_ids
+                .iter()
+                .any(|&i| self.shared.rules[i].action != RuleAction::Log);
+        let build = || {
+            let turn = self.calls();
+            build_state(&StateParts {
+                prompt: event.turn.prompt(),
+                tool: Some(event.tool),
+                input: Some(event.input),
+                calls: &turn.recent(),
+                ..StateParts::default()
+            })
+        };
+        if !blocking {
+            self.spawn_log(
                 "tool_before",
                 Some((event.call_id, event.tool)),
-                vec![Check::Approval],
-                || {
-                    let turn = self.calls();
-                    build_state(&StateParts {
-                        prompt: event.turn.prompt(),
-                        tool: Some(event.tool),
-                        input: Some(event.input),
-                        calls: &turn.recent(),
-                        ..StateParts::default()
-                    })
-                },
+                asked,
+                rule_ids,
+                build,
             );
+            return Box::pin(std::future::ready(ToolGate::keep(event.decision)));
         }
-        // At `log` the policy's decision stands.
-        Box::pin(std::future::ready(ToolGate::keep(event.decision)))
+        let Some(task) = self.prepare(
+            "tool_before",
+            Some((event.call_id, event.tool)),
+            asked,
+            rule_ids,
+            build,
+        ) else {
+            return Box::pin(std::future::ready(ToolGate::keep(event.decision)));
+        };
+        let mode = event.mode;
+        let decision = event.decision;
+        Box::pin(async move { task.run_tool_before(mode, decision).await })
     }
 
     fn tool_after(&self, event: &ToolAfter<'_>) -> BoxFuture<'static, HostReply> {
         let checks = &self.shared.checks;
         let outcome = checks.outcome != CheckAction::Off
             && outcome_applies(event.access, event.output.is_error);
-        let progress = checks.progress != CheckAction::Off;
-        let mut turn = self.calls();
-        if outcome || progress {
-            let earlier = if progress {
-                turn.failed.get(event.tool)
-            } else {
-                None
-            };
-            let mut asked = Vec::with_capacity(2);
+        let progress_enabled = checks.progress != CheckAction::Off;
+        let rule_ids = matching_rules(&self.shared.rules, RuleEvent::ToolAfter, Some(event.tool));
+
+        // Capture the earlier failed input and recent calls while
+        // updating `self.calls`, then drop the lock before calling
+        // `self.prepare` (which may lock `shared.notices`).
+        let task_opt = {
+            let mut turn = self.calls();
+            let has_earlier = progress_enabled && turn.failed.contains_key(event.tool);
+            let mut asked = Vec::new();
             if outcome {
                 asked.push(Check::Outcome);
             }
-            if earlier.is_some() {
+            if has_earlier {
                 asked.push(Check::Progress);
             }
-            if !asked.is_empty() {
-                self.ask(
-                    "tool_after",
-                    Some((event.call_id, event.tool)),
-                    asked,
-                    || {
-                        build_state(&StateParts {
-                            prompt: event.turn.prompt(),
-                            tool: Some(event.tool),
-                            input: Some(event.input),
-                            earlier_failed_input: earlier,
-                            output: Some(&event.output.content),
-                            calls: &turn.recent(),
-                            ..StateParts::default()
-                        })
-                    },
-                );
-            }
+            let eligible = (!asked.is_empty() || !rule_ids.is_empty()) && {
+                let t = self.session.turn.load(Ordering::Acquire);
+                self.session.build_failed.load(Ordering::Acquire) != t
+                    && !self.session.budget.spent()
+            };
+            let state = eligible.then(|| {
+                let earlier = if progress_enabled {
+                    turn.failed.get(event.tool)
+                } else {
+                    None
+                };
+                build_state(&StateParts {
+                    prompt: event.turn.prompt(),
+                    tool: Some(event.tool),
+                    input: Some(event.input),
+                    earlier_failed_input: earlier,
+                    output: Some(&event.output.content),
+                    calls: &turn.recent(),
+                    ..StateParts::default()
+                })
+            });
             // This call is an earlier failed call for the next ones.
-            if progress && event.output.is_error {
+            if progress_enabled && event.output.is_error {
                 turn.failed.insert(
                     event.tool.to_string(),
                     JsonHead::new(event.input, INPUT_CAP),
                 );
             }
+            // This call is an earlier call for the next events.
+            if turn.recent.len() == CALLS_SHOWN {
+                turn.recent.pop_front();
+            }
+            turn.recent
+                .push_back((event.tool.to_string(), event.output.is_error));
+            drop(turn);
+
+            if !asked.is_empty() || !rule_ids.is_empty() {
+                self.prepare(
+                    "tool_after",
+                    Some((event.call_id, event.tool)),
+                    asked,
+                    rule_ids,
+                    || state.unwrap_or_default(),
+                )
+            } else {
+                None
+            }
+        };
+
+        let Some(task) = task_opt else {
+            return Box::pin(std::future::ready(HostReply::default()));
+        };
+        let needs_note = task
+            .asked
+            .iter()
+            .any(|&check| checks.get(check) == CheckAction::Note)
+            || task
+                .rule_ids
+                .iter()
+                .any(|&i| self.shared.rules[i].action == RuleAction::Note);
+        if needs_note {
+            return Box::pin(async move { task.run_tool_after().await });
         }
-        // This call is an earlier call for the next events.
-        if turn.recent.len() == CALLS_SHOWN {
-            turn.recent.pop_front();
+        let needs_warn = task
+            .asked
+            .iter()
+            .any(|&check| checks.get(check) >= CheckAction::Warn)
+            || task
+                .rule_ids
+                .iter()
+                .any(|&i| self.shared.rules[i].action != RuleAction::Log);
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            log::warn!("judgments: no async runtime at tool_after; the checks send no request");
+            return Box::pin(std::future::ready(HostReply::default()));
+        };
+        #[cfg(test)]
+        self.shared.spawned.fetch_add(1, Ordering::Relaxed);
+        if needs_warn {
+            let session = Arc::clone(&self.session);
+            let task_turn = task.turn;
+            let handle = runtime.spawn(async move {
+                let reply = task.run_tool_after().await;
+                if session.turn.load(Ordering::Acquire) == task_turn {
+                    session.push_findings(reply.findings);
+                }
+            });
+            self.session.push_pending_warn(handle);
+        } else {
+            runtime.spawn(async move {
+                let _ = task.execute(BTreeMap::new()).await;
+            });
         }
-        turn.recent
-            .push_back((event.tool.to_string(), event.output.is_error));
         Box::pin(std::future::ready(HostReply::default()))
     }
 
     fn turn_end(&self, event: &TurnEnd<'_>) -> BoxFuture<'static, HostReply> {
         let completed = event.outcome == TurnEndOutcome::Outcome(TurnOutcome::Completed);
-        if self.shared.checks.claim != CheckAction::Off && completed {
-            let seen: Vec<CallSeen<'_>> = event.turn.calls().collect();
-            if claim_applies(event.outcome, seen.len()) {
-                self.ask("turn_end", None, vec![Check::Claim], || {
-                    let calls = call_list(seen.iter().copied());
-                    let final_message = event.turn.final_text();
-                    build_state(&StateParts {
-                        prompt: event.turn.prompt(),
-                        output: seen.last().map(|call| call.output),
-                        calls: &calls,
-                        final_message: final_message.as_deref(),
-                        ..StateParts::default()
-                    })
-                });
-            }
+        let claim_enabled = completed && self.shared.checks.claim != CheckAction::Off;
+        let rule_ids = if completed {
+            matching_rules(&self.shared.rules, RuleEvent::TurnEnd, None)
+        } else {
+            Vec::new()
+        };
+        let seen: Vec<CallSeen<'_>> = if claim_enabled || !rule_ids.is_empty() {
+            event.turn.calls().collect()
+        } else {
+            Vec::new()
+        };
+        let run_claim = claim_enabled && claim_applies(event.outcome, seen.len());
+        let mut asked = Vec::new();
+        if run_claim {
+            asked.push(Check::Claim);
         }
-        Box::pin(std::future::ready(HostReply::default()))
+        let task_opt = if !asked.is_empty() || !rule_ids.is_empty() {
+            self.prepare("turn_end", None, asked, rule_ids, || {
+                let calls = call_list(seen.iter().copied());
+                let final_message = event.turn.final_text();
+                build_state(&StateParts {
+                    prompt: event.turn.prompt(),
+                    output: seen.last().map(|call| call.output),
+                    calls: &calls,
+                    final_message: final_message.as_deref(),
+                    ..StateParts::default()
+                })
+            })
+        } else {
+            None
+        };
+        let pending_warns = self.session.take_pending_warns();
+        if !completed {
+            // On abort or provider error, return immediately without
+            // stalling on background warn tasks.
+            for handle in pending_warns {
+                handle.abort();
+            }
+            let mut reply = HostReply::default();
+            reply.findings = self.session.take_findings();
+            return Box::pin(std::future::ready(reply));
+        }
+        let needs_warn = task_opt.as_ref().is_some_and(|task| {
+            task.asked
+                .iter()
+                .any(|&check| self.shared.checks.get(check) >= CheckAction::Warn)
+                || task
+                    .rule_ids
+                    .iter()
+                    .any(|&i| self.shared.rules[i].action != RuleAction::Log)
+        });
+        if !needs_warn {
+            if let Some(task) = task_opt {
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    #[cfg(test)]
+                    self.shared.spawned.fetch_add(1, Ordering::Relaxed);
+                    runtime.spawn(async move {
+                        let _ = task.execute(BTreeMap::new()).await;
+                    });
+                } else {
+                    log::warn!(
+                        "judgments: no async runtime at turn_end; the checks send no request"
+                    );
+                }
+            }
+            if pending_warns.is_empty() {
+                let mut reply = HostReply::default();
+                reply.findings = self.session.take_findings();
+                return Box::pin(std::future::ready(reply));
+            }
+            let session = Arc::clone(&self.session);
+            return Box::pin(async move {
+                for handle in pending_warns {
+                    let _ = handle.await;
+                }
+                let mut reply = HostReply::default();
+                reply.findings = session.take_findings();
+                reply
+            });
+        }
+        let session = Arc::clone(&self.session);
+        Box::pin(async move {
+            let mut findings = Vec::new();
+            if let Some(task) = task_opt {
+                findings.extend(task.run_turn_end().await);
+            }
+            for handle in pending_warns {
+                let _ = handle.await;
+            }
+            let mut all = session.take_findings();
+            all.extend(findings);
+            let mut reply = HostReply::default();
+            reply.findings = all;
+            reply
+        })
     }
+
+    fn take_findings(&self) -> Vec<Finding> {
+        self.session.take_findings()
+    }
+}
+
+/// Indices of rules matching `event` and optional `tool`.
+fn matching_rules(rules: &[Rule], event: RuleEvent, tool: Option<&str>) -> Vec<usize> {
+    rules
+        .iter()
+        .enumerate()
+        .filter(|(_, rule)| {
+            rule.event == event
+                && match (&rule.tool, tool) {
+                    (None, _) => true,
+                    (Some(expected), Some(actual)) => expected == actual,
+                    (Some(_), None) => false,
+                }
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// Question id for rule `index`.
+pub(crate) fn rule_question_id(index: usize) -> String {
+    format!("rule.{index}")
+}
+
+/// Extract the probability of yes for `id` from `answers`.
+fn yes_prob(answers: &BTreeMap<String, Answer>, id: &str) -> Option<f64> {
+    match answers.get(id) {
+        Some(Answer::YesNo { yes, .. }) => Some(*yes),
+        _ => None,
+    }
+}
+
+fn approval_concern(destructive: f64, in_scope: f64) -> String {
+    format!("approval concern: destructive {destructive:.2}, in scope {in_scope:.2}")
+}
+
+fn approval_destructive_concern(destructive: f64) -> String {
+    format!("destructive call (probability {destructive:.2})")
 }
 
 /// Whether the approval check runs: a write or execute call that the
@@ -617,8 +1156,8 @@ fn call_list<'a>(calls: impl Iterator<Item = CallSeen<'a>>) -> Vec<(&'a str, boo
     calls.map(|call| (call.name, call.is_error)).collect()
 }
 
-/// The questions of the checks in `asked`, by id.
-fn questions(asked: &[Check]) -> BTreeMap<String, Question> {
+/// The questions of the checks in `asked` and rules in `rule_ids`, by id.
+fn questions(asked: &[Check], rule_ids: &[usize], rules: &[Rule]) -> BTreeMap<String, Question> {
     let mut questions = BTreeMap::new();
     for check in asked {
         let mut add = |id: &str, text: &str| {
@@ -632,6 +1171,11 @@ fn questions(asked: &[Check]) -> BTreeMap<String, Question> {
             Check::Outcome => add(OUTCOME, OUTCOME_TEXT),
             Check::Progress => add(PROGRESS, PROGRESS_TEXT),
             Check::Claim => add(CLAIM, CLAIM_TEXT),
+        }
+    }
+    for &index in rule_ids {
+        if let Some(rule) = rules.get(index) {
+            questions.insert(rule_question_id(index), Question::yes_no(&rule.ask));
         }
     }
     questions
@@ -648,6 +1192,7 @@ struct Ask {
     call_id: Option<String>,
     tool: Option<String>,
     asked: Vec<Check>,
+    rule_ids: Vec<usize>,
     state: String,
     /// When the event spawned the task: the permit wait counts from
     /// here.
@@ -661,20 +1206,27 @@ struct StateFacts {
     sha256: String,
 }
 
+/// A completed transport attempt before writing its `judgment` record.
+struct Attempt {
+    facts: StateFacts,
+    at: SystemTime,
+    round_trip: Duration,
+    outcome: Result<JudgeReply, String>,
+}
+
 impl Ask {
-    async fn run(mut self) {
-        // An event of a turn whose judge already failed to build tries
-        // no build of its own.
+    /// Run the judge request, returning `Some(Attempt)` if a record
+    /// should be written (success, timeout, error, or busy within cap),
+    /// or `None` if skipped (build failure, budget cap, or busy past cap).
+    async fn send(&mut self) -> Option<Attempt> {
         if self.session.build_failed.load(Ordering::Acquire) == self.turn {
-            return;
+            return None;
         }
         let shared = Arc::clone(&self.shared);
         let name = shared.judge.instance.name.as_str();
         let judge = match shared.judge.get() {
             Ok(judge) => judge,
             Err(error) => {
-                // No request and no record. Later events of this turn
-                // skip their check; the next turn tries again.
                 let session = &self.session;
                 if session.build_failed.swap(self.turn, Ordering::AcqRel) != self.turn {
                     log::warn!("judgments: judge `{name}` does not build: {error}");
@@ -685,7 +1237,7 @@ impl Ask {
                          request until it can."
                     ));
                 }
-                return;
+                return None;
             }
         };
         let deadline = tokio::time::Instant::from_std(self.spawned + shared.timeout);
@@ -694,47 +1246,324 @@ impl Ask {
             .ok()
             .and_then(Result::ok);
         let state = std::mem::take(&mut self.state);
+        let Some(_permit) = permit else {
+            if !self.session.budget.spent() {
+                let count = self.session.stats.busy.fetch_add(1, Ordering::Relaxed) + 1;
+                let cap = BUSY_RECORD_CAP.min(shared.max_calls.max(1));
+                if count <= cap {
+                    let facts = StateFacts {
+                        bytes: state.len() as u64,
+                        sha256: hex(&Sha256::digest(state.as_bytes())),
+                    };
+                    return Some(Attempt {
+                        facts,
+                        at: SystemTime::now(),
+                        round_trip: Duration::ZERO,
+                        outcome: Err(BUSY.to_string()),
+                    });
+                } else if !self.session.busy_noticed.swap(true, Ordering::AcqRel) {
+                    shared.notice(format!(
+                        "judgments: judge `{name}` is busy; suppressing further busy records \
+                         in this session"
+                    ));
+                }
+            }
+            return None;
+        };
+        if !self.session.budget.take() {
+            self.session.budget.notice(&shared);
+            return None;
+        }
         let facts = StateFacts {
             bytes: state.len() as u64,
             sha256: hex(&Sha256::digest(state.as_bytes())),
         };
-        let Some(_permit) = permit else {
-            // The run's requests were all busy: nothing went out. A
-            // session at its cap writes no more records.
-            if !self.session.budget.spent() {
-                let at = SystemTime::now();
-                self.write(&facts, at, Err(BUSY.to_string()), Duration::ZERO);
-            }
-            return;
-        };
-        if !self.session.budget.take() {
-            self.session.budget.notice(&shared);
-            return;
-        }
-        // The clock starts when the request goes out: the build and
-        // the permit wait are not in it.
         let at = SystemTime::now();
         let sent = Instant::now();
         let mut request = JudgeRequest::new(state, shared.timeout);
-        request.questions = questions(&self.asked);
+        request.questions = questions(&self.asked, &self.rule_ids, &shared.rules);
         let outcome = match tokio::time::timeout(shared.timeout, judge.ask(request)).await {
             Ok(Ok(reply)) => Ok(reply),
-            Ok(Err(JudgeError::Timeout(_))) | Err(_) => Err(TIMED_OUT.to_string()),
-            Ok(Err(error)) => Err(capped(&error.to_string(), ERROR_CAP).to_string()),
+            Ok(Err(JudgeError::Timeout(_))) | Err(_) => {
+                self.session.stats.timeouts.fetch_add(1, Ordering::Relaxed);
+                self.session.note_transport_failure(&shared, TIMED_OUT);
+                Err(TIMED_OUT.to_string())
+            }
+            Ok(Err(error)) => {
+                self.session.stats.errors.fetch_add(1, Ordering::Relaxed);
+                let text = capped(&error.to_string(), ERROR_CAP).to_string();
+                log::warn!("judgments: judge `{name}` failed: {text}");
+                self.session.note_transport_failure(&shared, &text);
+                Err(text)
+            }
         };
-        self.write(&facts, at, outcome, sent.elapsed());
+        Some(Attempt {
+            facts,
+            at,
+            round_trip: sent.elapsed(),
+            outcome,
+        })
+    }
+
+    /// Log-only execution: send and write the record with `fired`.
+    async fn execute(mut self, fired: BTreeMap<String, String>) {
+        if let Some(attempt) = self.send().await {
+            self.write(attempt, fired);
+        }
+    }
+
+    /// Blocking `tool_before` evaluation: rules first, then approval check.
+    async fn run_tool_before(mut self, mode: ApprovalMode, policy: ApprovalDecision) -> ToolGate {
+        let Some(attempt) = self.send().await else {
+            return ToolGate::keep(policy);
+        };
+        let mut fired: BTreeMap<String, String> = BTreeMap::new();
+        let mut gate = ToolGate::keep(policy);
+        if let Ok(reply) = &attempt.outcome {
+            let shared = &self.shared;
+            let mut denied = false;
+            // Stage 1: plain-language rules.
+            for &index in &self.rule_ids {
+                let rule = &shared.rules[index];
+                let qid = rule_question_id(index);
+                if let Some(yes) = yes_prob(&reply.answers, &qid)
+                    && yes >= rule.threshold
+                {
+                    match rule.action {
+                        RuleAction::Deny => {
+                            fired.insert(qid.clone(), "deny".to_string());
+                            self.session.stats.record_fired("deny");
+                            gate.findings.push(Finding::new(
+                                self.call_id.clone(),
+                                qid,
+                                "deny",
+                                &rule.reason,
+                            ));
+                            if !denied {
+                                denied = true;
+                                gate.decision = ApprovalDecision::Deny;
+                                gate.reason = Some(rule.reason.clone());
+                                gate.answer = Some("judge".to_string());
+                            }
+                        }
+                        RuleAction::Warn => {
+                            fired.insert(qid.clone(), "warn".to_string());
+                            self.session.stats.record_fired("warn");
+                            gate.findings.push(Finding::new(
+                                self.call_id.clone(),
+                                qid,
+                                "warn",
+                                &rule.reason,
+                            ));
+                        }
+                        RuleAction::Log | RuleAction::Note => {}
+                    }
+                }
+            }
+            // Stage 2: built-in approval check (never overrides a rule denial).
+            if !denied
+                && self.asked.contains(&Check::Approval)
+                && let (Some(p_d), Some(p_s)) = (
+                    yes_prob(&reply.answers, APPROVAL_DESTRUCTIVE),
+                    yes_prob(&reply.answers, APPROVAL_IN_SCOPE),
+                )
+            {
+                let action = shared.checks.approval;
+                match (mode, policy, action) {
+                    (ApprovalMode::Ask, ApprovalDecision::AskUser, CheckAction::Act) => {
+                        if approval_ask_allows(p_d, p_s) {
+                            fired.insert("approval".to_string(), "allow".to_string());
+                            self.session.stats.record_fired("allow");
+                            gate.decision = ApprovalDecision::Allow;
+                            gate.answer = Some("judge".to_string());
+                            gate.findings.push(Finding::new(
+                                self.call_id.clone(),
+                                "approval",
+                                "allow",
+                                format!(
+                                    "approved by judge (destructive {p_d:.2}, in scope {p_s:.2})"
+                                ),
+                            ));
+                        } else {
+                            fired.insert("approval".to_string(), "warn".to_string());
+                            self.session.stats.record_fired("warn");
+                            gate.findings.push(Finding::new(
+                                self.call_id.clone(),
+                                "approval",
+                                "warn",
+                                approval_concern(p_d, p_s),
+                            ));
+                        }
+                    }
+                    (ApprovalMode::Ask, ApprovalDecision::AskUser, CheckAction::Warn)
+                        if !approval_ask_allows(p_d, p_s) =>
+                    {
+                        fired.insert("approval".to_string(), "warn".to_string());
+                        self.session.stats.record_fired("warn");
+                        gate.findings.push(Finding::new(
+                            self.call_id.clone(),
+                            "approval",
+                            "warn",
+                            approval_concern(p_d, p_s),
+                        ));
+                    }
+                    (ApprovalMode::Auto, ApprovalDecision::Allow, CheckAction::Act)
+                        if approval_auto_asks(p_d) =>
+                    {
+                        let concern = approval_destructive_concern(p_d);
+                        fired.insert("approval".to_string(), "ask".to_string());
+                        self.session.stats.record_fired("ask");
+                        gate.decision = ApprovalDecision::AskUser;
+                        gate.reason = Some(concern.clone());
+                        gate.findings.push(Finding::new(
+                            self.call_id.clone(),
+                            "approval",
+                            "ask",
+                            concern,
+                        ));
+                    }
+                    (ApprovalMode::Auto, ApprovalDecision::Allow, CheckAction::Warn)
+                        if approval_auto_asks(p_d) =>
+                    {
+                        fired.insert("approval".to_string(), "warn".to_string());
+                        self.session.stats.record_fired("warn");
+                        gate.findings.push(Finding::new(
+                            self.call_id.clone(),
+                            "approval",
+                            "warn",
+                            approval_destructive_concern(p_d),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        self.write(attempt, fired);
+        gate
+    }
+
+    /// Evaluate `tool_after` checks (`outcome`, `progress`) and rules.
+    async fn run_tool_after(mut self) -> HostReply {
+        let Some(attempt) = self.send().await else {
+            return HostReply::default();
+        };
+        let mut fired: BTreeMap<String, String> = BTreeMap::new();
+        let mut reply_out = HostReply::default();
+        let mut notes: Vec<String> = Vec::new();
+        if let Ok(reply) = &attempt.outcome {
+            let shared = &self.shared;
+            for &check in &self.asked {
+                let (qid, label, text_fn): (&str, &str, fn(f64) -> String) = match check {
+                    Check::Outcome => (OUTCOME, "outcome", |p| {
+                        format!("command may have failed despite exit 0 (probability {p:.2})")
+                    }),
+                    Check::Progress => (PROGRESS, "progress", |p| {
+                        format!(
+                            "call may repeat an earlier failed action without material change \
+                             (probability {p:.2})"
+                        )
+                    }),
+                    _ => continue,
+                };
+                let action = shared.checks.get(check);
+                if action <= CheckAction::Log {
+                    continue;
+                }
+                if let Some(yes) = yes_prob(&reply.answers, qid)
+                    && check_fires(yes)
+                {
+                    let text = text_fn(yes);
+                    let action_str = action.as_str();
+                    fired.insert(label.to_string(), action_str.to_string());
+                    self.session.stats.record_fired(action_str);
+                    reply_out.findings.push(Finding::new(
+                        self.call_id.clone(),
+                        label,
+                        action_str,
+                        &text,
+                    ));
+                    if action == CheckAction::Note {
+                        notes.push(format!("[judgment: {label}] {text}"));
+                    }
+                }
+            }
+            for &index in &self.rule_ids {
+                let rule = &shared.rules[index];
+                if rule.action == RuleAction::Log {
+                    continue;
+                }
+                let qid = rule_question_id(index);
+                if let Some(yes) = yes_prob(&reply.answers, &qid)
+                    && yes >= rule.threshold
+                {
+                    let action_str = rule.action.as_str();
+                    fired.insert(qid.clone(), action_str.to_string());
+                    self.session.stats.record_fired(action_str);
+                    reply_out.findings.push(Finding::new(
+                        self.call_id.clone(),
+                        qid.clone(),
+                        action_str,
+                        &rule.reason,
+                    ));
+                    if rule.action == RuleAction::Note {
+                        notes.push(format!("[judgment: {qid}] {}", rule.reason));
+                    }
+                }
+            }
+        }
+        if !notes.is_empty() {
+            reply_out.note = Some(notes.join("\n"));
+        }
+        self.write(attempt, fired);
+        reply_out
+    }
+
+    /// Evaluate `turn_end` checks (`claim`) and rules.
+    async fn run_turn_end(mut self) -> Vec<Finding> {
+        let Some(attempt) = self.send().await else {
+            return Vec::new();
+        };
+        let mut fired: BTreeMap<String, String> = BTreeMap::new();
+        let mut findings = Vec::new();
+        if let Ok(reply) = &attempt.outcome {
+            let shared = &self.shared;
+            if self.asked.contains(&Check::Claim)
+                && shared.checks.claim >= CheckAction::Warn
+                && let Some(yes) = yes_prob(&reply.answers, CLAIM)
+                && check_fires(yes)
+            {
+                let text = format!(
+                    "final message may claim a result not shown by tool evidence \
+                     (probability {yes:.2})"
+                );
+                fired.insert("claim".to_string(), "warn".to_string());
+                self.session.stats.record_fired("warn");
+                findings.push(Finding::new(None, "claim", "warn", text));
+            }
+            for &index in &self.rule_ids {
+                let rule = &shared.rules[index];
+                if rule.action == RuleAction::Log {
+                    continue;
+                }
+                let qid = rule_question_id(index);
+                if let Some(yes) = yes_prob(&reply.answers, &qid)
+                    && yes >= rule.threshold
+                {
+                    let action_str = rule.action.as_str();
+                    fired.insert(qid.clone(), action_str.to_string());
+                    self.session.stats.record_fired(action_str);
+                    findings.push(Finding::new(None, qid, action_str, &rule.reason));
+                }
+            }
+        }
+        self.write(attempt, fired);
+        findings
     }
 
     /// Write the record of this request: sent at `at` and answered
     /// after `round_trip`, or failed with an error. A request that
     /// never went out has a round trip of 0.
-    fn write(
-        &self,
-        facts: &StateFacts,
-        at: SystemTime,
-        outcome: Result<demerzel_core::JudgeReply, String>,
-        round_trip: Duration,
-    ) {
+    fn write(&self, attempt: Attempt, fired: BTreeMap<String, String>) {
         let shared = &self.shared;
         let mut record = JudgmentRecord::new(self.event, shared.judge.instance.name.as_str());
         record.call_id.clone_from(&self.call_id);
@@ -747,11 +1576,27 @@ impl Ask {
                 (check.as_str().to_string(), action.as_str().to_string())
             })
             .collect();
-        record.at = humantime::format_rfc3339_millis(at).to_string();
-        record.duration_ms = u64::try_from(round_trip.as_millis()).unwrap_or(u64::MAX);
-        record.state_bytes = facts.bytes;
-        record.state_sha256.clone_from(&facts.sha256);
-        match outcome {
+        record.rules = self
+            .rule_ids
+            .iter()
+            .filter_map(|&index| {
+                let rule = shared.rules.get(index)?;
+                Some((
+                    rule_question_id(index),
+                    JudgmentRuleRecord::new(
+                        rule.action.as_str(),
+                        rule.source_name(),
+                        rule.threshold,
+                    ),
+                ))
+            })
+            .collect();
+        record.fired = fired;
+        record.at = humantime::format_rfc3339_millis(attempt.at).to_string();
+        record.duration_ms = u64::try_from(attempt.round_trip.as_millis()).unwrap_or(u64::MAX);
+        record.state_bytes = attempt.facts.bytes;
+        record.state_sha256.clone_from(&attempt.facts.sha256);
+        match attempt.outcome {
             Ok(reply) => {
                 record.answers = reply
                     .answers
@@ -764,12 +1609,13 @@ impl Ask {
             Err(error) => record.error = Some(error),
         }
         log::info!(
-            "judgment {} call_id={} duration_ms={} state_bytes={} answers={} error={}",
+            "judgment {} call_id={} duration_ms={} state_bytes={} answers={} fired={} error={}",
             record.event,
             record.call_id.as_deref().unwrap_or("-"),
             record.duration_ms,
             record.state_bytes,
             record.answers.len(),
+            record.fired.len(),
             record.error.as_deref().unwrap_or("-")
         );
         if let Err(error) = self.writer.append_judgment(&record) {
@@ -1509,7 +2355,7 @@ mod tests {
 
     #[test]
     fn one_request_asks_the_questions_of_its_checks() {
-        let ids = |asked: &[Check]| questions(asked).into_keys().collect::<Vec<_>>();
+        let ids = |asked: &[Check]| questions(asked, &[], &[]).into_keys().collect::<Vec<_>>();
         assert_eq!(
             ids(&[Check::Approval]),
             [APPROVAL_DESTRUCTIVE, APPROVAL_IN_SCOPE]

@@ -60,10 +60,18 @@ instance = "judge"               # user file only; unset: no check runs
 max_calls = 500                  # judge requests one session may send
 
 [judgments.checks]
-outcome = "log"                  # off | log
-progress = "log"
-claim = "log"
-approval = "log"
+outcome = "log"                  # off | log | warn | note
+progress = "log"                 # off | log | warn | note
+claim = "log"                    # off | log | warn
+approval = "log"                 # off | log | warn | act
+
+[[judgments.rules]]              # user or project file; no rule can approve
+event = "tool_before"            # tool_before | tool_after | turn_end
+tool = "bash"                    # optional exact tool name
+ask = "Does this command write under protected/?"
+action = "deny"                  # log | warn | note | deny (by event)
+threshold = 0.8                  # optional, default 0.8
+reason = "protected/ is off limits."
 
 [roles.default]                  # the head target and its fallbacks, see Roles
 chain = [
@@ -101,6 +109,7 @@ error = "bright-red"
 | `judgments.instance` | — | — | unset: no check runs |
 | `judgments.checks.<name>` | — | — | `log` |
 | `judgments.max_calls` | — | — | `500` |
+| `judgments.rules` | — | — | empty list |
 | `history_file` | — | — | `true` |
 | `prompt.base_file` | — | — | unset: the built-in base prompt |
 | `tui.mouse` | — | — | `true` |
@@ -231,8 +240,10 @@ model adapters, not the judge kind.
 
 `jev-latest` is an alias. The service can move an alias to a new
 version, and the answers of the judge can then change. `doctor`
-prints a note for an alias. Pin a version id, such as `jev-1.14.0`,
-to keep the model fixed.
+prints a note for an alias when every check and rule stays at `off`
+or `log`. It prints a warning when any check or rule acts above
+`log`. Pin a version id, such as `jev-1.14.0`, to keep the model
+fixed.
 
 A judge instance finds its key in this order:
 
@@ -328,25 +339,25 @@ Demerzel sends the judge a short state of the turn and yes-or-no
 questions about it. The judge answers each question with the
 probability of yes.
 
-In this build, the checks only record. A check changes no decision,
-no tool result, and no request to the main model. The `warn`, `note`,
-and `act` actions and the judgment rules arrive in a later step.
+Each built-in check defaults to `log`. At `log`, a check writes a
+record and changes nothing. Higher actions warn the user, append a
+note to a tool result, adjust approvals, or deny a call.
 
 ### The keys
 
 - `judgments.instance`: the judge instance. It names an instance of
   the `typesafe` kind: the implicit `typesafe` instance or a
   `[providers.<name>]` table; see "The judge kind". Without it, no
-  check runs. Only the user file can set it. No flag and no variable
-  turns judgments on.
-- `judgments.checks.<name>`: the action of one check. The values are
-  `off` and `log`. The default is `log`. A check at `off` sends no
-  question.
+  check or rule runs. Only the user file can set it. No flag and no
+  variable turns judgments on.
+- `judgments.checks.<name>`: the action of one check. The default is
+  `log`. A check at `off` sends no question. Each check allows its own
+  actions; see "The checks".
 - `judgments.max_calls`: the most judge requests that one session can
   send. The value is a positive integer. The default is `500`.
+- `[[judgments.rules]]`: a list of plain-language rules. Both the user
+  file and the project file can add rules; see "Rules".
 
-`judgments.rules` is not in this build. In the user file, it stops the
-run at boot. In a project file, the run ignores it with a warning.
 Another key under `[judgments]` warns as an unknown key. An unknown
 check name warns too.
 
@@ -355,41 +366,112 @@ check name warns too.
 Each check asks at one event of the turn. The `event` field of the
 record names the event.
 
-| Check | Event | Question ids | The check asks when |
-|---|---|---|---|
-| `approval` | `tool_before` | `approval.destructive`, `approval.in_scope` | The approval policy asks the user about a write or execute call in `ask` mode, or allows the call in `auto` mode. |
-| `outcome` | `tool_after` | `outcome` | An execute call, such as `bash`, returns without its error flag. |
-| `progress` | `tool_after` | `progress` | An earlier call of the same tool in the turn ran and failed. A call that the policy refused or the user declined does not count. |
-| `claim` | `turn_end` | `claim` | The turn completes, and it holds at least one tool call. |
+| Check | Event | Actions | Question ids | The check asks when |
+|---|---|---|---|---|
+| `approval` | `tool_before` | `off`, `log`, `warn`, `act` | `approval.destructive`, `approval.in_scope` | The approval policy asks the user about a write or execute call in `ask` mode, or allows the call in `auto` mode. |
+| `outcome` | `tool_after` | `off`, `log`, `warn`, `note` | `outcome` | An execute call, such as `bash`, returns without its error flag. |
+| `progress` | `tool_after` | `off`, `log`, `warn`, `note` | `progress` | An earlier call of the same tool in the turn ran and failed. A call that the policy refused or the user declined does not count. |
+| `claim` | `turn_end` | `off`, `log`, `warn` | `claim` | The turn completes, and it holds at least one tool call. |
 
-In `read-only` mode, the policy refuses each write and execute call,
-so the `approval` check does not ask.
+In `read-only` mode, the policy refuses each write and execute call
+before any judgment runs. A judge never allows a call in `read-only`
+mode.
 
-One event sends one request with the questions of all its checks. An
-event without a check that asks sends no request.
+One event sends one request with the questions of all its checks and
+matching rules. An event without a check or rule that asks sends no
+request.
 
-`log` means this: the judge answers, and the session file keeps the
-answers in a `judgment` record. Nothing else changes.
+The actions work as follows:
+
+- `off`: the check sends no question.
+- `log`: the judge answers, and the session file keeps the answers in
+  a `judgment` record. Nothing else changes.
+- `warn`: when a check fires, Demerzel shows a finding on the tool
+  card in the full-screen interface or on stderr in the plain
+  interface. `outcome`, `progress`, and `claim` fire at probability
+  `0.8` or higher. At `tool_after`, `warn` runs beside the next model
+  call and does not delay the tool result. At `turn_end`, `warn` waits
+  for the answer before the turn returns.
+- `note`: for `outcome` and `progress`, when the check fires at
+  probability `0.8` or higher, Demerzel waits for the answer, shows a
+  finding, and appends a short `[judgment: ...]` line to the tool
+  result before the main model reads it. Nothing else in the history
+  changes.
+- `act`: for `approval`, Demerzel waits for the answer before the tool
+  call runs:
+  1. In `ask` mode, when `approval.destructive <= 0.05` and
+     `approval.in_scope >= 0.9`, Demerzel runs the call without asking
+     the user. The `approval` record keeps `decision: "allow"` and
+     `answer: "judge"`. This approval creates no session grant.
+  2. In `ask` mode, when either bound fails, Demerzel shows the
+     concern before the approval question and asks the user as usual.
+  3. In `auto` mode, when `approval.destructive >= 0.5`, Demerzel asks
+     the user and shows the concern. A run without an approval prompt
+     refuses the call and gives the concern to the model.
+
+### Rules
+
+A `[[judgments.rules]]` entry asks one yes-or-no question in plain
+language at one turn event. Both the user file and the project file
+can add rules. User rules run before project rules.
+
+Each rule takes these keys:
+
+- `event` (required): `tool_before`, `tool_after`, or `turn_end`.
+- `ask` (required): a non-empty question for the judge.
+- `action` (required): the action when the answer reaches `threshold`.
+  No rule can approve a call. The valid actions by event:
+  - `tool_before`: `log`, `warn`, `deny`.
+  - `tool_after`: `log`, `warn`, `note`.
+  - `turn_end`: `log`, `warn`.
+- `tool` (optional): an exact tool name. When set, the rule runs only
+  for that tool. A `turn_end` rule cannot set `tool`.
+- `threshold` (optional): a number strictly between `0` and `1`. The
+  default is `0.8`.
+- `reason` (optional): the text shown to the user and given to the
+  model on `deny` or `note`. When omitted, Demerzel uses `ask`.
+
+Rules run before the `approval` check at `tool_before`. A `deny` rule
+blocks the call even when `approval = "act"` rates the call safe. The
+`approval` record keeps `decision: "deny"` and `answer: "judge"`, and
+the model receives `reason` as the tool error. A `tool_before` rule at
+`deny` or `warn` runs on every matching tool call, including read-only
+tools, unless the policy already denied the call.
+
+An invalid rule in the user file stops the run at boot. An invalid
+rule in a project file prints a warning, and the run drops that rule.
+
+### Inspecting judgments
+
+`/judgments` works in both the full-screen and plain interfaces. It
+shows the judge instance, the model id, each check action, each rule
+with its source, the session call count against `max_calls`, and the
+counts of fired actions.
 
 ### Limits
 
 - The call cap: `judgments.max_calls` counts the requests of one
   session that went out. Each session that a run opens starts a new
-  count, also after `/new`. At the cap, the checks of the session send
-  no more requests. The session shows one notice at the first check
-  that the cap stops. Thus a session that sends exactly `max_calls`
-  requests shows no notice.
+  count, also after `/new`. At the cap, the checks and rules of the
+  session send no more requests, and each policy decision stands. The
+  session shows one notice at the first check that the cap stops. Thus
+  a session that sends exactly `max_calls` requests shows no notice.
 - The requests in flight: one run sends at most 8 judge requests at
   the same time, over all its sessions. A check waits for a free
   place, at most the request timeout from its event. A check that
   gets no place sends nothing. Its record has the error `busy` and a
-  `duration_ms` of 0. It does not count against `max_calls`. A session
-  at its cap writes no `busy` record. Thus a long turn with a stalled
-  judge can write one `busy` record for each event.
+  `duration_ms` of 0. It does not count against `max_calls`. One
+  session writes at most 32 `busy` records so a stalled judge cannot
+  flood the session file.
 - The timeout: each request has 2 seconds, retries included. The
   judge retries status 429, status 529 and the other 5xx statuses, and
   network failures. It follows `retry-after` inside the 2 seconds.
   Every other status fails at once.
+- Failure fallback: a timeout, a transport failure, a `busy` wait, or
+  the call cap leaves the policy decision unchanged. When any check or
+  rule acts above `log`, the session shows one notice on the first
+  request failure. When every check and rule stays at `off` or `log`,
+  request failures write only to the session file and the debug log.
 - A judge that does not build, for example without a key, sends no
   request and writes no record. The run tries the build again once in
   each turn. The session shows one notice, and its turns continue. A
@@ -399,8 +481,9 @@ answers in a `judgment` record. Nothing else changes.
   call then waits at its exit for that request. The wait at the exit
   has a bound; see "The record".
 
-A turn never waits for the judge. Each request runs beside the turn,
-and its record lands when the request ends.
+Checks at `log` and `tool_after` checks at `warn` run beside the turn.
+Blocking checks (`tool_before` above `log`, `tool_after` at `note`,
+and `turn_end` above `log`) wait inside the 2-second timeout.
 
 ### What the judge receives
 
@@ -430,16 +513,19 @@ instance that you trust with the content of your project.
 
 Each request writes one `judgment` record in the session file. A
 check that gets no place in flight writes one too, with the error
-`busy`. The schema of the session file stays 1. A reader without this
-record type skips it. Replay also skips a `judgment` record that this
-build cannot read, so the session still replays and resumes.
+`busy`, up to the 32-record session cap. The schema of the session
+file stays 1. A reader without this record type skips it. Replay also
+skips a `judgment` record that this build cannot read, so the session
+still replays and resumes.
 
 | Field | Content |
 |---|---|
 | `event` | `tool_before`, `tool_after`, or `turn_end` |
 | `call_id` | the id of the tool call; absent at `turn_end` |
 | `tool` | the tool name; absent at `turn_end` |
-| `checks` | each check that asked, with the action that config sets for it: `log` |
+| `checks` | each check that asked, with the action that config sets for it; absent when only rules asked |
+| `rules` | each rule that asked, keyed by `rule.<index>`, with `action`, `source` (`user` or `project`), and `threshold`; absent when no rule asked |
+| `fired` | each check or rule that acted, mapped to the action taken (`warn`, `note`, `deny`, `allow`, or `ask`); absent when none fired |
 | `instance` | the judge instance |
 | `model` | the model id in the reply; absent after a failure |
 | `answers` | each answer by question id; see the answer shapes below; absent after a failure |
@@ -463,18 +549,19 @@ The record stores each answer in one of three shapes, by its `type`:
   from 0; `probabilities`, a list with one probability for each level;
   and an optional `confidence`.
 
-The built-in checks of this build ask only yes-or-no questions.
+The built-in checks and rules ask yes-or-no questions.
 
 To compare a judgment with the user's answer, pair two records. The
 `call_id` of a `tool_before` record equals the `tool_use_id` of the
 `approval` record of the same call. The `approval` record holds the
-policy's decision and the user's answer.
+policy's decision and the answer: `allow`, `allow_for_session`, `deny`,
+`abort`, or `judge` when a judge approval or rule decided the call.
 
-This pairing has a limit. Some servers use one call id again in one
-session. When a server sends no call id, the `openai-compat` and
-`openai-responses` adapters make one up as `call_<index>`, so ids
-repeat across turns. For an id that occurs more than once, the pairs
-are not certain. An analysis must drop such ids.
+When a server omits a tool call id, the `openai-compat` and
+`openai-responses` adapters generate a per-stream unique id of the
+form `call_<nonce>_<index>`. Some servers still reuse their own wire
+ids across turns. An analysis must drop any call id that occurs more
+than once in one session.
 
 Before a run ends, each interface waits for the judge requests in
 flight. The wait lasts at most two request timeouts and a short margin.
@@ -486,7 +573,7 @@ A Ctrl-C during the wait ends it. The records in flight are then lost.
 In a one-shot run, the exit status stays the status of the turn.
 
 A one-shot run that made a tool call ends with the `claim` check in
-flight. Thus its exit waits for that answer.
+flight when `claim = "log"`. Thus its exit waits for that answer.
 
 These events can lose the records of the requests in flight:
 
@@ -503,24 +590,27 @@ These problems stop the run at boot:
   can in this build.
 - The judge instance sets a key that its kind does not take, such as
   `thinking`.
-- The user file sets a check to a value other than `off` or `log`.
-  The message names the valid values.
-- The user file sets `judgments.rules`.
+- The user file sets a check to an action that the check does not
+  allow. The message names the valid values.
+- The user file defines an invalid rule under `[[judgments.rules]]`.
 - A value has the wrong type in either file: a `judgments` that is
   not a table, an `instance` that is not a string, a `checks` that is
-  not a table, or a `max_calls` that is not a positive integer.
+  not a table, a `rules` that is not an array of tables, or a
+  `max_calls` that is not a positive integer.
 
 `doctor` shows a judgments section:
 
 - the judge instance with its kind, its endpoint, its model, and the
   source of its key;
-- a note for an alias model id;
+- a note for an alias model id at `log` or `off`, or a warning when
+  any check or rule acts above `log`;
 - a warning when the judge has no usable key;
 - a warning for each key that a judge ignores: `effort` and
   `context_window`;
 - each check with its action and the layer that set it;
+- each configured rule with its event, action, threshold, and source;
 - `max_calls` and the layer that set it;
-- each project key that the trust rules ignore;
+- each project key or project rule that the trust rules ignore;
 - each problem that stops a run.
 
 Without `judgments.instance`, the section says that judgments are off.
@@ -1013,14 +1103,16 @@ privilege, move credentials, or raise cost:
   that the harness gives the model.
 - It cannot set `judgments.instance`. Only the user file turns
   judgments on.
-- It cannot set `judgments.rules`. The run ignores the key with a
-  warning.
+- It can add `[[judgments.rules]]` entries. No rule can approve a
+  call, so a project rule can only log, warn, note, or deny. Invalid
+  project rules warn and drop out.
 - It cannot change the judge instance. When the user file names a
   judge instance, the run ignores each key of the project's
   `[providers.<name>]` table for that instance. A judge receives tool
   input and output.
-- It can lower a check from `log` to `off`. It cannot raise a check.
-  The run ignores a project check value other than `off` or `log`,
+- It can lower a check action along `off < log < warn < note < act`.
+  It cannot raise a check action above the user file's setting or the
+  default `log`. The run ignores an invalid or higher project action
   with a warning.
 - It cannot raise `judgments.max_calls` above the user file's value,
   or above the default `500`.
@@ -1061,4 +1153,7 @@ M3 step 2 ([`m3-plan.md`](m3-plan.md)) added provider instances,
 system prompt, the instruction files, the profile file, and
 `prompt.base_file` on 2026-11-12. M3 step 8a added the `typesafe`
 judge kind, the `[judgments]` table with `instance`, `checks`, and
-`max_calls`, and the `judgment` record on 2026-11-15.
+`max_calls`, and the `judgment` record on 2026-11-15. M3 step 8b added
+the `warn`, `note`, `act`, and `deny` actions, `[[judgments.rules]]`,
+`/judgments`, the `judge` approval answer, and the `rules` and `fired`
+fields on `judgment` records on 2026-11-21.

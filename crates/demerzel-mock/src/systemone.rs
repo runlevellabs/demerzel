@@ -15,11 +15,31 @@ use serde_json::{Map, Value, json};
 
 /// The scripted judge of a mock server.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct JudgeScript {
     /// The `model` field of every reply.
     pub model: String,
-    /// One wire answer per question id.
+    /// Default wire answer per question id.
     pub answers: BTreeMap<String, Value>,
+    /// Optional per-request answer overrides, indexed by 0-based
+    /// answered request count. Any question id present in
+    /// `sequence[index]` overrides `answers` for that request.
+    pub sequence: Vec<BTreeMap<String, Value>>,
+}
+
+impl JudgeScript {
+    pub fn new(model: impl Into<String>, answers: BTreeMap<String, Value>) -> Self {
+        Self {
+            model: model.into(),
+            answers,
+            sequence: Vec::new(),
+        }
+    }
+
+    pub fn with_sequence(mut self, sequence: Vec<BTreeMap<String, Value>>) -> Self {
+        self.sequence = sequence;
+        self
+    }
 }
 
 /// A yes-or-no answer: the probability of yes.
@@ -62,10 +82,13 @@ pub fn score(score: f64, probabilities: &[f64], confidence: f64) -> Value {
 }
 
 /// The reply to one judge request: the 200 body, or the status and
-/// body of a refusal. `authorized` says the request carried a bearer
+/// body of a refusal. `index` is the 0-based count of previously
+/// answered judge requests, selecting an optional override from
+/// `script.sequence`. `authorized` says the request carried a bearer
 /// key.
 pub(crate) fn answer(
     script: &JudgeScript,
+    index: usize,
     authorized: bool,
     body: &Value,
 ) -> Result<Value, (StatusCode, Value)> {
@@ -89,9 +112,13 @@ pub(crate) fn answer(
         .and_then(Value::as_object)
         .filter(|questions| !questions.is_empty())
         .ok_or_else(|| invalid(&["body", "questions"], "the request has no questions"))?;
+    let override_map = script.sequence.get(index);
     let mut answers = Map::new();
     for (id, question) in questions {
-        let Some(answer) = script.answers.get(id) else {
+        let Some(answer) = override_map
+            .and_then(|step| step.get(id))
+            .or_else(|| script.answers.get(id))
+        else {
             return Err(invalid(
                 &["body", "questions", id],
                 "the script has no answer for this question",
@@ -135,9 +162,9 @@ mod tests {
     use std::time::Duration;
 
     fn script() -> JudgeScript {
-        JudgeScript {
-            model: "judge-9.9.9".into(),
-            answers: BTreeMap::from([
+        JudgeScript::new(
+            "judge-9.9.9",
+            BTreeMap::from([
                 ("done".to_string(), noul(0.875)),
                 (
                     "kind".to_string(),
@@ -145,7 +172,7 @@ mod tests {
                 ),
                 ("risk".to_string(), score(0.5, &[0.5, 0.5], 0.25)),
             ]),
-        }
+        )
     }
 
     fn request(ids: &[(&str, &str)]) -> Value {
@@ -159,21 +186,38 @@ mod tests {
     #[test]
     fn each_question_gets_its_scripted_answer() {
         let body = request(&[("done", "noul"), ("kind", "choice"), ("risk", "score")]);
-        let reply = answer(&script(), true, &body).unwrap();
+        let reply = answer(&script(), 0, true, &body).unwrap();
         assert_eq!(reply["model"], "judge-9.9.9");
         assert_eq!(reply["answers"]["done"], noul(0.875));
         assert_eq!(reply["answers"]["kind"]["probabilities"]["docs"], 0.25);
         assert_eq!(reply["answers"]["risk"]["probabilities"]["1"], 0.5);
         assert_eq!(reply["usage"]["input_tokens"], 3);
         // Only the asked questions get an answer.
-        let reply = answer(&script(), true, &request(&[("done", "noul")])).unwrap();
+        let reply = answer(&script(), 0, true, &request(&[("done", "noul")])).unwrap();
         assert_eq!(reply["answers"].as_object().unwrap().len(), 1);
+        // Sequence overrides vary answers by request index and fall back to defaults.
+        let varied = script().with_sequence(vec![
+            BTreeMap::from([("done".to_string(), noul(0.1))]),
+            BTreeMap::from([("done".to_string(), noul(0.95))]),
+        ]);
+        assert_eq!(
+            answer(&varied, 0, true, &request(&[("done", "noul")])).unwrap()["answers"]["done"],
+            noul(0.1)
+        );
+        assert_eq!(
+            answer(&varied, 1, true, &request(&[("done", "noul")])).unwrap()["answers"]["done"],
+            noul(0.95)
+        );
+        assert_eq!(
+            answer(&varied, 2, true, &request(&[("done", "noul")])).unwrap()["answers"]["done"],
+            noul(0.875)
+        );
     }
 
     #[test]
     fn a_missing_key_answer_or_type_is_refused() {
         let body = request(&[("done", "noul")]);
-        let (status, _) = answer(&script(), false, &body).unwrap_err();
+        let (status, _) = answer(&script(), 0, false, &body).unwrap_err();
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         for body in [
             request(&[("done", "noul"), ("other", "noul")]),
@@ -183,7 +227,7 @@ mod tests {
             json!({"model": "judge-0.0.1", "state": "s", "questions": {"done": {"type": "noul"}}}),
             json!({"state": "s", "questions": {"done": {"type": "noul"}}}),
         ] {
-            let (status, detail) = answer(&script(), true, &body).unwrap_err();
+            let (status, detail) = answer(&script(), 0, true, &body).unwrap_err();
             assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
             assert!(detail["detail"][0]["loc"].is_array(), "{detail}");
         }

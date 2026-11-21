@@ -252,6 +252,7 @@ what each final state proves:
 | `recover-from-failures` | `check.before` holds the output and exit status 1 of the first check. The `edit` with a stale tag changed nothing. The `edit` with the correct tag wrote `version = 2`. `check.after` holds the output and exit status 0 of the second check. |
 | `project-config` | The run used the mock. The project config file names another provider, model, and endpoint. |
 | `judged-run` | The checks at `log` changed no file: `test.out` holds exit status 0, `mode.txt` says `strict`, and `lint.out` holds two runs with exit status 1. The mock answered 7 judge requests and refused none, so each request carried the judge model of the run's config. The oracle also reads the session file; see below. |
+| `judged-actions` | A `tool_before` deny rule blocked a `bash` call targeting `protected.txt`, leaving it unchanged. A second `bash` call succeeded and wrote `ok.txt`. An `outcome = "note"` check appended a note to that `bash` result, and `claim = "warn"` ran at turn end without firing. The oracle checks the files, the `approval` record (`answer: "judge"`), the `judgment` `rules` and `fired` fields, and the appended note. |
 
 A `judged-run` run sends 7 judge requests:
 
@@ -409,14 +410,22 @@ This run sends two judge requests: the `approval` check before the
   model id of each judge reply. A non-empty string.
 - `requests`: the number of judge requests that the task expects. A
   non-negative integer. The runner compares it with the mock's count.
-- `answers`: one answer for each question id, in the wire shape of
-  its type. A non-empty object. The three types and their members:
+- `answers`: one default answer for each question id, in the wire
+  shape of its type. The three types and their members:
   1. `noul`: `type` and `noul`, a number.
   2. `choice`: `type`, `choice`, `probabilities`, and `confidence`.
      `probabilities` is an object of numbers by option name.
   3. `score`: `type`, `score`, `probabilities`, `confidence`, and
      `legend`. `probabilities` is an object of numbers by level, with
      the keys `"0"` to `"n-1"`. `legend` has one string for each level.
+- `sequence` (optional): a list of answer objects, indexed by judge
+  request number (0-based). Each entry overrides `answers` for that
+  request, so a task can vary judge answers across events.
+- `checks` (optional): a map of built-in check names to action
+  strings written into `[judgments.checks]` in the scratch user config.
+- `rules` (optional): a list of rule objects (`event`, `ask`,
+  `action`, and optional `tool`, `threshold`, `reason`) written as
+  `[[judgments.rules]]` in the scratch user config.
 
 The built-in checks ask yes-or-no questions, so they need `noul`
 answers. Their question ids are `approval.destructive`,
@@ -508,3 +517,26 @@ empty variable is an error. `--bank` and `--tasks` exclude each other.
 
 Keep private data out of the public set. Each public task is a
 synthetic fixture.
+
+## The judgment gate fixtures
+
+Two synthetic fixture sets live under `bench/eval/` for live judge
+verification:
+
+- `bench/eval/risky_calls.json`: 120 risky Write and Execute tool
+  calls across 8 categories. The approval gate requires zero approvals
+  across this set.
+- `bench/eval/check_cases.json`: 60 labeled positive and negative
+  cases for `outcome`, `progress`, and `claim` at threshold `0.8`.
+
+Run the live gate against your configured `typesafe` judge instance:
+
+```bash
+cargo run --release -p demerzel --example judge_gate -- \
+  --risky bench/eval/risky_calls.json \
+  --checks bench/eval/check_cases.json
+```
+
+Pass `--sessions <dir>` to check paired Step 8a session records, and
+`--replay-historical` to replay earlier `ask_user` records. `bench/test_risky_calls.py`
+validates both fixture files without network access.

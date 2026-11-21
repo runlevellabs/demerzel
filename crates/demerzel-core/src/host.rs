@@ -52,6 +52,12 @@ pub trait LoopHost: Send + Sync {
     fn turn_end(&self, _event: &TurnEnd<'_>) -> BoxFuture<'static, HostReply> {
         Box::pin(std::future::ready(HostReply::default()))
     }
+
+    /// Drain findings produced asynchronously since the last call (for
+    /// example, a `warn` check that ran beside the next model call).
+    fn take_findings(&self) -> Vec<Finding> {
+        Vec::new()
+    }
 }
 
 /// The `turn_start` event.
@@ -121,11 +127,49 @@ impl TurnEndOutcome {
     }
 }
 
+/// One user-visible finding from a loop host, emitted by the engine as
+/// [`crate::EngineEvent::Judgment`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Finding {
+    /// The tool call the finding is about; `None` at `turn_end`.
+    pub call_id: Option<String>,
+    /// The check or rule that produced the finding (e.g. `"outcome"`,
+    /// `"approval"`, `"rule"`).
+    pub source: String,
+    /// The action that fired (`"warn"`, `"note"`, `"allow"`, `"ask"`, `"deny"`).
+    pub action: String,
+    /// Human-readable description of the finding.
+    pub text: String,
+}
+
+impl Finding {
+    pub fn new(
+        call_id: Option<String>,
+        source: impl Into<String>,
+        action: impl Into<String>,
+        text: impl Into<String>,
+    ) -> Self {
+        Self {
+            call_id,
+            source: source.into(),
+            action: action.into(),
+            text: text.into(),
+        }
+    }
+}
+
 /// What a host returns at `turn_start`, `tool_after`, and `turn_end`.
-/// It holds nothing yet; later fields stay additive.
 #[derive(Debug, Clone, Default, PartialEq)]
 #[non_exhaustive]
-pub struct HostReply {}
+pub struct HostReply {
+    /// Text appended to a tool call's result at `tool_after`, so the
+    /// model reads it on the next call and a resume replays identical
+    /// bytes. Ignored on other events.
+    pub note: Option<String>,
+    /// Findings to emit as [`crate::EngineEvent::Judgment`].
+    pub findings: Vec<Finding>,
+}
 
 /// What a host returns at `tool_before`.
 #[derive(Debug, Clone, PartialEq)]
@@ -134,12 +178,58 @@ pub struct ToolGate {
     /// The decision the host asks for. The engine applies it within
     /// its limits.
     pub decision: ApprovalDecision,
+    /// Why the host denied or escalated the call. For `Deny`, this
+    /// becomes the model's error result. For `AskUser` over an `Allow`
+    /// policy, a run without an approval prompt includes it in its
+    /// refusal message.
+    pub reason: Option<String>,
+    /// Who made a non-user decision for the `approval` session record
+    /// (for example `"judge"` for a judge approval or rule denial).
+    pub answer: Option<String>,
+    /// Findings to emit as [`crate::EngineEvent::Judgment`] before the
+    /// approval question or tool dispatch.
+    pub findings: Vec<Finding>,
 }
 
 impl ToolGate {
     /// A gate that keeps `decision`.
     pub fn keep(decision: ApprovalDecision) -> Self {
-        Self { decision }
+        Self {
+            decision,
+            reason: None,
+            answer: None,
+            findings: Vec::new(),
+        }
+    }
+
+    /// A gate that approves a call on behalf of `answer` (e.g. `"judge"`).
+    pub fn allow(answer: impl Into<String>) -> Self {
+        Self {
+            decision: ApprovalDecision::Allow,
+            reason: None,
+            answer: Some(answer.into()),
+            findings: Vec::new(),
+        }
+    }
+
+    /// A gate that denies a call on behalf of `answer` with `reason`.
+    pub fn deny(answer: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            decision: ApprovalDecision::Deny,
+            reason: Some(reason.into()),
+            answer: Some(answer.into()),
+            findings: Vec::new(),
+        }
+    }
+
+    /// A gate that escalates a call to an approval question with `reason`.
+    pub fn ask(reason: impl Into<String>) -> Self {
+        Self {
+            decision: ApprovalDecision::AskUser,
+            reason: Some(reason.into()),
+            answer: None,
+            findings: Vec::new(),
+        }
     }
 }
 

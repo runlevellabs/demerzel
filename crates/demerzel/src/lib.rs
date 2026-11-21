@@ -9,7 +9,8 @@ mod commands;
 pub mod config;
 pub mod doctor;
 mod git;
-mod judgments;
+#[doc(hidden)]
+pub mod judgments;
 pub mod login;
 mod preview;
 mod prompt;
@@ -922,6 +923,27 @@ impl Runtime {
             &self.read_only_registry
         } else {
             &self.registry
+        }
+    }
+
+    /// Status summary for `/judgments`.
+    pub fn judgments_note(&self) -> String {
+        match &self.judging {
+            Some(judging) => judging.summary(),
+            None => match &self.config.judgments {
+                Some(judgments) => format!(
+                    "judgments: {} (all checks off, no rules)",
+                    judgments.instance
+                ),
+                None => "judgments: off — set judgments.instance in the user file".to_string(),
+            },
+        }
+    }
+
+    /// Clear the active session handle for `/judgments` after `/new`.
+    pub(crate) fn clear_judgments_session(&self) {
+        if let Some(judging) = &self.judging {
+            judging.clear_session();
         }
     }
 

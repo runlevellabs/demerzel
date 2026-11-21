@@ -330,6 +330,14 @@ impl EventSink for Renderer {
                 let line = self.dimmed(&text);
                 self.status_line(&line);
             }
+            EngineEvent::Judgment {
+                source,
+                action,
+                text,
+                ..
+            } => {
+                self.status_line(&format!("! judgment ({source}, {action}): {text}"));
+            }
             _ => {}
         }
     }
@@ -431,6 +439,7 @@ async fn repl(runtime: &Runtime) -> Result<(), RunError> {
                     Some(Effect::NewSession) => {
                         engine = None;
                         resume = Resume::Fresh;
+                        runtime.clear_judgments_session();
                         eprintln!("{NEW_SESSION_NOTE}");
                         continue;
                     }
@@ -439,6 +448,10 @@ async fn repl(runtime: &Runtime) -> Result<(), RunError> {
                             .as_ref()
                             .map(|engine| (engine.session().id(), engine.session().path()));
                         eprintln!("{}", session_note(session));
+                        continue;
+                    }
+                    Some(Effect::Judgments) => {
+                        eprintln!("{}", runtime.judgments_note());
                         continue;
                     }
                     Some(Effect::SetModel(name)) => {

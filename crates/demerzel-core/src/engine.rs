@@ -42,7 +42,8 @@ use serde_json::Value;
 
 use crate::approval::{ApprovalDecision, ApprovalMode, ApprovalPolicy, ApprovalRequest};
 use crate::host::{
-    LoopHost, ToolAfter, ToolBefore, TurnEnd, TurnEndOutcome, TurnStart, TurnView, constrain,
+    Finding, LoopHost, ToolAfter, ToolBefore, TurnEnd, TurnEndOutcome, TurnStart, TurnView,
+    constrain,
 };
 use crate::message::{ContentBlock, Message, Role, StopReason, Usage};
 use crate::provider::{Effort, Provider, ProviderError, Request, StreamEvent};
@@ -142,6 +143,18 @@ pub enum EngineEvent<'a> {
     },
     /// Usage for one model call.
     ModelUsage(Usage),
+    /// A judgment check or rule fired with a user-visible action.
+    #[non_exhaustive]
+    Judgment {
+        /// The tool call the finding is about; `None` at `turn_end`.
+        call_id: Option<&'a str>,
+        /// The check or rule that produced the finding.
+        source: &'a str,
+        /// The action that fired (`warn`, `note`, `allow`, `ask`, `deny`).
+        action: &'a str,
+        /// Human-readable description of the finding.
+        text: &'a str,
+    },
 }
 
 /// Receives display events during a turn. Implementations take `&self`
@@ -461,7 +474,9 @@ impl<'a> Engine<'a> {
                 outcome,
                 turn: self.turn_view(&[]),
             };
-            host.turn_end(&event).await;
+            let reply = host.turn_end(&event).await;
+            emit_findings(sink, &reply.findings);
+            emit_findings(sink, &host.take_findings());
         }
         result
     }
@@ -482,7 +497,8 @@ impl<'a> Engine<'a> {
         approver: &mut dyn Approver,
     ) -> Result<TurnOutcome, EngineError> {
         if let Some(host) = &self.host {
-            host.turn_start(&TurnStart { prompt: &text }).await;
+            let reply = host.turn_start(&TurnStart { prompt: &text }).await;
+            emit_findings(sink, &reply.findings);
         }
         self.turn_start = self.history.len();
         // Repair results ride in front of the user text, inside one
@@ -672,7 +688,7 @@ impl<'a> Engine<'a> {
         let provider = self.providers.provider(&target.instance)?;
         let request = self.assemble(provider, target, effort);
         let stream = provider.stream(request).await?;
-        collect_response(stream, sink, emitted).await
+        collect_response(stream, sink, self.host.as_deref(), emitted).await
     }
 
     /// Fixed prompt assembly for `target`: system prompt, then
@@ -901,11 +917,14 @@ impl<'a> Engine<'a> {
             let verdict = match access {
                 None => Verdict::Run,
                 Some(access) => {
-                    let mut decision = self.policy.decide(&ApprovalRequest {
+                    let policy_decision = self.policy.decide(&ApprovalRequest {
                         tool: &name,
                         access,
                         input,
                     });
+                    let mut decision = policy_decision;
+                    let mut gate_reason: Option<String> = None;
+                    let mut gate_answer: Option<String> = None;
                     if let Some(host) = &self.host {
                         let event = ToolBefore {
                             call_id: &id,
@@ -913,19 +932,23 @@ impl<'a> Engine<'a> {
                             input,
                             access,
                             mode: self.policy.mode,
-                            decision,
+                            decision: policy_decision,
                             turn: self.turn_view(&batch.results),
                         };
-                        let asked = host.tool_before(&event).await.decision;
-                        let kept = constrain(decision, asked);
-                        if kept != asked {
+                        let gate = host.tool_before(&event).await;
+                        let kept = constrain(policy_decision, gate.decision);
+                        if kept != gate.decision {
                             log::warn!(
                                 "approval {name} call_id={id}: the host asked for {} over {}; \
                                  the engine keeps {}",
-                                asked.as_str(),
-                                decision.as_str(),
+                                gate.decision.as_str(),
+                                policy_decision.as_str(),
                                 kept.as_str()
                             );
+                        } else {
+                            emit_findings(sink, &gate.findings);
+                            gate_reason = gate.reason;
+                            gate_answer = gate.answer;
                         }
                         decision = kept;
                     }
@@ -938,26 +961,41 @@ impl<'a> Engine<'a> {
                         answer,
                         ApprovalAnswer::Allow | ApprovalAnswer::AllowForSession
                     );
-                    let answer_name = match answer {
+                    let user_answer = match answer {
                         ApprovalAnswer::Allow => "allow",
                         ApprovalAnswer::AllowForSession => "allow_for_session",
                         ApprovalAnswer::Deny => "deny",
                         ApprovalAnswer::Abort => "abort",
                     };
                     let asked = matches!(decision, ApprovalDecision::AskUser);
+                    let host_overrode = !asked && decision != policy_decision;
+                    let record_approved = if asked {
+                        Some(approved)
+                    } else if host_overrode {
+                        Some(decision == ApprovalDecision::Allow)
+                    } else {
+                        None
+                    };
+                    let record_answer = if asked {
+                        Some(user_answer)
+                    } else if host_overrode {
+                        gate_answer.as_deref()
+                    } else {
+                        None
+                    };
                     log::info!(
                         "approval {name} call_id={id} mode={} decision={} answer={}",
                         self.policy.mode,
                         decision.as_str(),
-                        if asked { answer_name } else { "-" }
+                        record_answer.unwrap_or("-")
                     );
                     self.session.append_approval(
                         &name,
                         self.policy.mode,
                         decision,
                         &id,
-                        asked.then_some(approved),
-                        asked.then_some(answer_name),
+                        record_approved,
+                        record_answer,
                     )?;
                     if answer == ApprovalAnswer::AllowForSession {
                         self.policy.grant(&ApprovalRequest {
@@ -969,23 +1007,35 @@ impl<'a> Engine<'a> {
                     if approved {
                         Verdict::Run
                     } else if decision == ApprovalDecision::Deny {
-                        Verdict::Refuse(format!(
-                            "the approval mode refuses the {name} tool in this session"
-                        ))
+                        let message = if policy_decision == ApprovalDecision::Deny {
+                            format!("the approval mode refuses the {name} tool in this session")
+                        } else {
+                            gate_reason.unwrap_or_else(|| {
+                                format!("the {name} call was denied before execution")
+                            })
+                        };
+                        Verdict::Refuse(message)
                     } else if answer == ApprovalAnswer::Abort {
                         batch.aborted = true;
                         Verdict::Refuse(format!(
                             "the user stopped the turn; the {name} call did not run"
                         ))
                     } else {
-                        Verdict::Refuse(approver.deny_message(&name))
+                        let mut message = approver.deny_message(&name);
+                        if policy_decision == ApprovalDecision::Allow
+                            && let Some(reason) = gate_reason
+                        {
+                            message.push_str(": ");
+                            message.push_str(&reason);
+                        }
+                        Verdict::Refuse(message)
                     }
                 }
             };
             let ran = matches!(verdict, Verdict::Run);
             let at = SystemTime::now();
             let started = Instant::now();
-            let output = match verdict {
+            let mut output = match verdict {
                 Verdict::Run => self.tools.run_approved(&name, input.clone()).await,
                 Verdict::Refuse(message) => ToolOutput::error(message),
             };
@@ -999,7 +1049,12 @@ impl<'a> Engine<'a> {
                     output: &output,
                     turn: self.turn_view(&batch.results),
                 };
-                host.tool_after(&event).await;
+                let reply = host.tool_after(&event).await;
+                emit_findings(sink, &reply.findings);
+                emit_findings(sink, &host.take_findings());
+                if let Some(note) = reply.note.filter(|note| !note.is_empty()) {
+                    append_note(&mut output.content, &note);
+                }
             }
             // The summary carries the tool's own outcome line — for
             // bash, the exit code.
@@ -1110,6 +1165,32 @@ fn falls_back(error: &EngineError) -> bool {
     )
 }
 
+/// Emit each host finding as an [`EngineEvent::Judgment`].
+fn emit_findings(sink: &dyn EventSink, findings: &[Finding]) {
+    for finding in findings {
+        sink.event(EngineEvent::Judgment {
+            call_id: finding.call_id.as_deref(),
+            source: &finding.source,
+            action: &finding.action,
+            text: &finding.text,
+        });
+    }
+}
+
+/// Append a host note to a tool result's content so the model reads it
+/// on the next call and a resume sends the same bytes.
+fn append_note(content: &mut String, note: &str) {
+    if content.is_empty() {
+        content.push_str(note);
+    } else if content.ends_with('\n') {
+        content.push('\n');
+        content.push_str(note);
+    } else {
+        content.push_str("\n\n");
+        content.push_str(note);
+    }
+}
+
 /// Drain one response stream into an assistant message, preserving the
 /// block order the model produced. `emitted` turns true at the first
 /// event that reaches the sink: from then on, a failure cannot fall
@@ -1117,6 +1198,7 @@ fn falls_back(error: &EngineError) -> bool {
 async fn collect_response(
     mut stream: crate::provider::EventStream,
     sink: &dyn EventSink,
+    host: Option<&dyn LoopHost>,
     emitted: &mut bool,
 ) -> Result<ModelResponse, EngineError> {
     let mut blocks: Vec<ContentBlock> = Vec::new();
@@ -1129,6 +1211,9 @@ async fn collect_response(
                 "the stream ended without a done event".to_string(),
             )));
         };
+        if let Some(host) = host {
+            emit_findings(sink, &host.take_findings());
+        }
         match item? {
             StreamEvent::TextDelta(delta) => {
                 *emitted = true;
@@ -3335,5 +3420,265 @@ mod tests {
                 .any(|line| line.starts_with("tool_after"));
             assert_eq!(after, ran, "{mode} {gate:?}");
         }
+    }
+
+    #[test]
+    fn host_gate_records_judge_answer_reason_and_appends_tool_after_note() {
+        use crate::host::{Finding, HostReply, ToolGate};
+        use ApprovalDecision::{Allow, AskUser, Deny};
+
+        struct ActionHost {
+            gate: ToolGate,
+            note: Option<String>,
+            after_finding: Option<Finding>,
+            end_finding: Option<Finding>,
+        }
+
+        impl LoopHost for ActionHost {
+            fn tool_before<'a>(&'a self, _event: &'a ToolBefore<'a>) -> BoxFuture<'a, ToolGate> {
+                Box::pin(std::future::ready(self.gate.clone()))
+            }
+
+            fn tool_after(&self, _event: &ToolAfter<'_>) -> BoxFuture<'static, HostReply> {
+                let mut reply = HostReply::default();
+                reply.note.clone_from(&self.note);
+                if let Some(finding) = &self.after_finding {
+                    reply.findings.push(finding.clone());
+                }
+                Box::pin(std::future::ready(reply))
+            }
+
+            fn turn_end(&self, _event: &TurnEnd<'_>) -> BoxFuture<'static, HostReply> {
+                let mut reply = HostReply::default();
+                if let Some(finding) = &self.end_finding {
+                    reply.findings.push(finding.clone());
+                }
+                Box::pin(std::future::ready(reply))
+            }
+        }
+
+        // 1. Host deny writes `answer: "judge"` and sends custom reason to model.
+        let dir = tempfile::tempdir().unwrap();
+        let provider = ScriptedProvider::new(vec![
+            tool_call("c1", "exec", json!({"cmd": "rm -rf auth"})),
+            text_done("stopped"),
+        ]);
+        let tools = FakeTools;
+        let session = session_in(&dir);
+        let mut gate = ToolGate::deny("judge", "src/auth/ is off limits");
+        gate.findings.push(Finding::new(
+            Some("c1".into()),
+            "rule.0",
+            "deny",
+            "src/auth/ is off limits",
+        ));
+        let host = ActionHost {
+            gate,
+            note: None,
+            after_finding: None,
+            end_finding: None,
+        };
+        let mut engine = hosted_engine(
+            &provider,
+            &tools,
+            ApprovalMode::Auto,
+            session,
+            Some(Box::new(host)),
+        );
+        let events = Mutex::new(Vec::new());
+        let sink = |event: EngineEvent<'_>| {
+            if let EngineEvent::Judgment {
+                call_id,
+                source,
+                action,
+                text,
+                ..
+            } = event
+            {
+                events.lock().unwrap().push((
+                    call_id.map(str::to_string),
+                    source.to_string(),
+                    action.to_string(),
+                    text.to_string(),
+                ));
+            }
+        };
+        block_on(engine.user_turn("go".into(), &sink, &mut NoPrompt)).unwrap();
+        let recs = records(&engine);
+        let approval = recs.iter().find(|r| r["type"] == "approval").unwrap();
+        assert_eq!(approval["decision"], "deny");
+        assert_eq!(approval["approved"], false);
+        assert_eq!(approval["answer"], "judge");
+        let ContentBlock::ToolResult {
+            content, is_error, ..
+        } = &engine.history()[2].content[0]
+        else {
+            panic!("expected tool result");
+        };
+        assert!(*is_error);
+        assert_eq!(content, "src/auth/ is off limits");
+        assert_eq!(
+            events.into_inner().unwrap(),
+            vec![(
+                Some("c1".into()),
+                "rule.0".into(),
+                "deny".into(),
+                "src/auth/ is off limits".into()
+            )]
+        );
+
+        // 2. Host Ask->Allow writes `answer: "judge"`, creates no session grant,
+        //    and `tool_after` note joins stored tool result + emits findings.
+        let dir = tempfile::tempdir().unwrap();
+        let provider = ScriptedProvider::new(vec![
+            tool_call("c1", "exec", json!({"cmd": "ls"})),
+            text_done("done"),
+        ]);
+        let session = session_in(&dir);
+        let host = ActionHost {
+            gate: ToolGate::allow("judge"),
+            note: Some("[judgment: outcome] silent failure".into()),
+            after_finding: Some(Finding::new(
+                Some("c1".into()),
+                "outcome",
+                "note",
+                "silent failure",
+            )),
+            end_finding: Some(Finding::new(None, "claim", "warn", "check evidence")),
+        };
+        let mut engine = hosted_engine(
+            &provider,
+            &tools,
+            ApprovalMode::Ask,
+            session,
+            Some(Box::new(host)),
+        );
+        let events = Mutex::new(Vec::new());
+        let sink = |event: EngineEvent<'_>| {
+            if let EngineEvent::Judgment {
+                call_id,
+                source,
+                action,
+                ..
+            } = event
+            {
+                events.lock().unwrap().push((
+                    call_id.map(str::to_string),
+                    source.to_string(),
+                    action.to_string(),
+                ));
+            }
+        };
+        block_on(engine.user_turn("go".into(), &sink, &mut NoPrompt)).unwrap();
+        let recs = records(&engine);
+        let approval = recs.iter().find(|r| r["type"] == "approval").unwrap();
+        assert_eq!(approval["decision"], "allow");
+        assert_eq!(approval["approved"], true);
+        assert_eq!(approval["answer"], "judge");
+        let ContentBlock::ToolResult {
+            content, is_error, ..
+        } = &engine.history()[2].content[0]
+        else {
+            panic!("expected tool result");
+        };
+        assert!(!*is_error);
+        assert!(
+            content.ends_with("[judgment: outcome] silent failure"),
+            "{content}"
+        );
+        assert_eq!(
+            events.into_inner().unwrap(),
+            vec![
+                (Some("c1".into()), "outcome".into(), "note".into()),
+                (None, "claim".into(), "warn".into()),
+            ]
+        );
+
+        // 3. Host Auto->Ask with NoPrompt refuses and includes the reason.
+        let dir = tempfile::tempdir().unwrap();
+        let provider = ScriptedProvider::new(vec![
+            tool_call("c1", "exec", json!({"cmd": "rm -rf /tmp/x"})),
+            text_done("aborted"),
+        ]);
+        let session = session_in(&dir);
+        let host = ActionHost {
+            gate: ToolGate::ask("destructive call (probability 0.95)"),
+            note: None,
+            after_finding: None,
+            end_finding: None,
+        };
+        let mut engine = hosted_engine(
+            &provider,
+            &tools,
+            ApprovalMode::Auto,
+            session,
+            Some(Box::new(host)),
+        );
+        block_on(engine.user_turn("go".into(), &noop_sink(), &mut NoPrompt)).unwrap();
+        let ContentBlock::ToolResult {
+            content, is_error, ..
+        } = &engine.history()[2].content[0]
+        else {
+            panic!("expected tool result");
+        };
+        assert!(*is_error);
+        assert!(
+            content.contains("destructive call (probability 0.95)"),
+            "{content}"
+        );
+
+        // 4. Host ReadOnly Deny->Allow override is refused and its reason,
+        //    answer, and findings are all dropped.
+        let dir = tempfile::tempdir().unwrap();
+        let provider = ScriptedProvider::new(vec![
+            tool_call("c1", "exec", json!({"cmd": "ls"})),
+            text_done("blocked"),
+        ]);
+        let session = session_in(&dir);
+        let mut bad_gate = ToolGate::allow("judge");
+        bad_gate.reason = Some("should not appear".into());
+        bad_gate.findings.push(Finding::new(
+            Some("c1".into()),
+            "approval",
+            "allow",
+            "should not emit",
+        ));
+        let host = ActionHost {
+            gate: bad_gate,
+            note: None,
+            after_finding: None,
+            end_finding: None,
+        };
+        let mut engine = hosted_engine(
+            &provider,
+            &tools,
+            ApprovalMode::ReadOnly,
+            session,
+            Some(Box::new(host)),
+        );
+        let events = Mutex::new(Vec::new());
+        let sink = |event: EngineEvent<'_>| {
+            if let EngineEvent::Judgment { source, .. } = event {
+                events.lock().unwrap().push(source.to_string());
+            }
+        };
+        block_on(engine.user_turn("go".into(), &sink, &mut NoPrompt)).unwrap();
+        assert!(events.into_inner().unwrap().is_empty());
+        let recs = records(&engine);
+        let approval = recs.iter().find(|r| r["type"] == "approval").unwrap();
+        assert_eq!(approval["decision"], "deny");
+        assert!(approval.get("answer").is_none());
+        let ContentBlock::ToolResult {
+            content, is_error, ..
+        } = &engine.history()[2].content[0]
+        else {
+            panic!("expected tool result");
+        };
+        assert!(*is_error);
+        assert!(!content.contains("should not appear"), "{content}");
+
+        // Also confirm Allow->Deny / Ask->Allow constants used cleanly.
+        assert_ne!(Allow, AskUser);
+        assert_ne!(AskUser, Deny);
     }
 }

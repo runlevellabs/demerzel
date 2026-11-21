@@ -191,11 +191,12 @@ pub enum SessionRecord {
         /// Id of the tool call the decision was for.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool_use_id: Option<String>,
-        /// The user's answer when the decision was `AskUser`.
+        /// Outcome when the user was asked (`AskUser`) or when a host
+        /// overrode the policy decision (`Allow` or `Deny`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         approved: Option<bool>,
         /// The literal answer for the audit trail: `allow`,
-        /// `allow_for_session`, `deny`, or `abort`.
+        /// `allow_for_session`, `deny`, `abort`, or `judge`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         answer: Option<String>,
     },
@@ -261,6 +262,28 @@ pub enum SessionRecord {
     Unknown,
 }
 
+/// Metadata for one configured rule that asked in a `judgment` record.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct JudgmentRuleRecord {
+    /// The rule's configured action: `log`, `warn`, `note`, or `deny`.
+    pub action: String,
+    /// Where the rule came from: `user` or `project`.
+    pub source: String,
+    /// The rule's firing threshold.
+    pub threshold: f64,
+}
+
+impl JudgmentRuleRecord {
+    pub fn new(action: impl Into<String>, source: impl Into<String>, threshold: f64) -> Self {
+        Self {
+            action: action.into(),
+            source: source.into(),
+            threshold,
+        }
+    }
+}
+
 /// One judge request with its answers, or its failure. The record
 /// completes off the turn's path, so it can land after records that
 /// follow its event; `at` places it. A `tool_before` record pairs with
@@ -274,9 +297,19 @@ pub struct JudgmentRecord {
     pub call_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool: Option<String>,
-    /// Each check that asked in the request, with the action config
-    /// sets for it. What the answers made fire is not here.
+    /// Each built-in check that asked in the request, with the action
+    /// config sets for it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub checks: BTreeMap<String, String>,
+    /// Each configured rule that asked in the request, keyed by its
+    /// question id, with its configured action, source, and threshold.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub rules: BTreeMap<String, JudgmentRuleRecord>,
+    /// Each check or rule whose answer crossed its threshold, mapped to
+    /// the action that fired (for example `warn`, `note`, `allow`,
+    /// `ask`, `deny`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub fired: BTreeMap<String, String>,
     /// The judge instance name.
     pub instance: String,
     /// The model id from the reply.
@@ -297,7 +330,7 @@ pub struct JudgmentRecord {
     pub duration_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<JudgeUsage>,
-    /// "timeout", or the error text, cut at 1 KiB.
+    /// "timeout", "busy", or the error text, cut at 1 KiB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -311,6 +344,8 @@ impl JudgmentRecord {
             call_id: None,
             tool: None,
             checks: BTreeMap::new(),
+            rules: BTreeMap::new(),
+            fired: BTreeMap::new(),
             instance: instance.into(),
             model: None,
             answers: BTreeMap::new(),
@@ -1537,6 +1572,11 @@ mod tests {
         record.tool = Some("bash".into());
         record.checks.insert("outcome".into(), "log".into());
         record.checks.insert("progress".into(), "log".into());
+        record.rules.insert(
+            "rule.0".into(),
+            JudgmentRuleRecord::new("warn", "user", 0.8),
+        );
+        record.fired.insert("rule.0".into(), "warn".into());
         record.model = Some("judge-1.0.0".into());
         record.answers.insert(
             "outcome".into(),
@@ -1567,6 +1607,8 @@ mod tests {
                 "call_id": "call_3",
                 "tool": "bash",
                 "checks": {"outcome": "log", "progress": "log"},
+                "rules": {"rule.0": {"action": "warn", "source": "user", "threshold": 0.8}},
+                "fired": {"rule.0": "warn"},
                 "instance": "judge",
                 "model": "judge-1.0.0",
                 "answers": {
@@ -1589,13 +1631,32 @@ mod tests {
         // The optional fields stay out when empty, and come back empty.
         let sparse = SessionRecord::Judgment(JudgmentRecord::new("turn_end", "judge"));
         let value = serde_json::to_value(&sparse).unwrap();
-        for absent in ["call_id", "tool", "model", "answers", "usage", "error"] {
+        for absent in [
+            "call_id", "tool", "checks", "rules", "fired", "model", "answers", "usage", "error",
+        ] {
             assert!(value.get(absent).is_none(), "{absent}: {value}");
         }
         assert_eq!(
             serde_json::from_value::<SessionRecord>(value).unwrap(),
             sparse
         );
+
+        // Pre-8b records without `rules` or `fired` still deserialize cleanly.
+        let pre_8b = serde_json::json!({
+            "type": "judgment",
+            "event": "turn_end",
+            "checks": {"claim": "log"},
+            "instance": "judge",
+            "state_bytes": 10,
+            "state_sha256": "00".repeat(32),
+            "at": "2026-11-15T10:00:00.000Z",
+            "duration_ms": 50
+        });
+        let SessionRecord::Judgment(parsed) = serde_json::from_value(pre_8b).unwrap() else {
+            panic!("expected judgment");
+        };
+        assert!(parsed.rules.is_empty());
+        assert!(parsed.fired.is_empty());
     }
 
     #[test]

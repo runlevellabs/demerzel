@@ -162,9 +162,9 @@ async fn the_reply_keeps_a_pinned_or_an_alias_model_id() {
 #[tokio::test]
 async fn one_request_carries_every_question_under_its_id_with_its_wire_type() {
     let mock = MockServer::start(Vec::new(), Vec::new()).await;
-    mock.set_judge(JudgeScript {
-        model: "jev-1.14.0".into(),
-        answers: BTreeMap::from([
+    mock.set_judge(JudgeScript::new(
+        "jev-1.14.0",
+        BTreeMap::from([
             ("plain".to_string(), systemone::noul(0.5)),
             ("framed".to_string(), systemone::noul(0.125)),
             (
@@ -176,7 +176,7 @@ async fn one_request_carries_every_question_under_its_id_with_its_wire_type() {
                 systemone::score(0.25, &[0.75, 0.25], 0.75),
             ),
         ]),
-    });
+    ));
     let mut request = JudgeRequest::new("state text".into(), BUDGET);
     request
         .questions

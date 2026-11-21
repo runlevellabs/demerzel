@@ -10,7 +10,8 @@ use std::sync::Mutex;
 use demerzel::config::{self, Check, CheckAction, Judgments, Layer};
 use demerzel::{AuthPaths, Resume, RunConfig, Runtime, SessionSettings};
 use demerzel_core::{
-    ApprovalAnswer, ApprovalMode, Approver, BoxFuture, EngineEvent, EventSink, TurnOutcome,
+    ApprovalAnswer, ApprovalMode, Approver, BoxFuture, ContentBlock, EngineEvent, EventSink,
+    TurnOutcome,
 };
 use demerzel_mock::compat::{text_turn, tool_calls_turn, tool_turn};
 use demerzel_mock::systemone::noul;
@@ -34,16 +35,16 @@ const CLAIM: &str = "claim";
 /// A scripted judge that answers every built-in question; `destructive`
 /// and `in_scope` set the approval answers.
 fn judge_script(destructive: f64, in_scope: f64) -> JudgeScript {
-    JudgeScript {
-        model: JUDGE_MODEL.into(),
-        answers: BTreeMap::from([
+    JudgeScript::new(
+        JUDGE_MODEL,
+        BTreeMap::from([
             (DESTRUCTIVE.to_string(), noul(destructive)),
             (IN_SCOPE.to_string(), noul(in_scope)),
             (OUTCOME.to_string(), noul(0.1)),
             (PROGRESS.to_string(), noul(0.2)),
             (CLAIM.to_string(), noul(0.3)),
         ]),
-    }
+    )
 }
 
 struct Bed {
@@ -1180,4 +1181,558 @@ async fn the_state_lists_the_last_ten_earlier_calls_of_the_turn() {
         vec!["bash ok".to_string(); 10]
     );
     assert_eq!(calls(of("echo again")), None);
+}
+
+#[tokio::test]
+async fn warn_and_note_emit_judgment_events_and_note_joins_tool_result() {
+    let bed = Bed::start(vec![
+        tool_turn("c1", "bash", json!({"command": "echo ok"})),
+        text_turn("all tests passed"),
+    ])
+    .await;
+    bed.mock.set_judge(JudgeScript::new(
+        JUDGE_MODEL,
+        BTreeMap::from([
+            (DESTRUCTIVE.to_string(), noul(0.01)),
+            (IN_SCOPE.to_string(), noul(0.98)),
+            (OUTCOME.to_string(), noul(0.92)),
+            (PROGRESS.to_string(), noul(0.1)),
+            (CLAIM.to_string(), noul(0.88)),
+        ]),
+    ));
+    let mut judgments = Judgments::new(JUDGE);
+    judgments.checks.set(Check::Outcome, CheckAction::Note);
+    judgments.checks.set(Check::Claim, CheckAction::Warn);
+    judgments.checks.set(Check::Approval, CheckAction::Off);
+    let runtime =
+        Runtime::new(bed.judged_at(ApprovalMode::Auto, judgments, &bed.mock.url(), true)).unwrap();
+    let settings = SessionSettings::from_config(runtime.config());
+    let mut opened = runtime
+        .open(&Resume::Fresh, &settings, "run tests")
+        .unwrap();
+    let seen_events = Mutex::new(Vec::new());
+    let sink = |event: EngineEvent<'_>| {
+        if let EngineEvent::Judgment {
+            call_id,
+            source,
+            action,
+            text,
+            ..
+        } = event
+        {
+            seen_events.lock().unwrap().push((
+                call_id.map(str::to_string),
+                source.to_string(),
+                action.to_string(),
+                text.to_string(),
+            ));
+        }
+    };
+    let outcome = opened
+        .engine
+        .user_turn("run tests".into(), &sink, &mut demerzel_core::NoPrompt)
+        .await
+        .unwrap();
+    assert_eq!(outcome, TurnOutcome::Completed);
+    runtime.settle().await;
+
+    let events = seen_events.into_inner().unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|(id, src, act, _)| id.as_deref() == Some("c1")
+                && src == "outcome"
+                && act == "note"),
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|(id, src, act, _)| id.is_none() && src == "claim" && act == "warn"),
+        "{events:?}"
+    );
+
+    // Note joined the stored tool result sent to the model on the second request.
+    let model_requests = bed.model_bodies();
+    assert_eq!(model_requests.len(), 2);
+    let tool_msg = model_requests[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "tool")
+        .unwrap();
+    let tool_content = tool_msg["content"].as_str().unwrap();
+    assert!(
+        tool_content.contains("[judgment: outcome]"),
+        "{tool_content}"
+    );
+    // System prompt never received the judgment text.
+    let system_msg = &model_requests[1]["messages"][0]["content"];
+    assert!(!system_msg.as_str().unwrap().contains("[judgment:"));
+
+    // Session records hold `fired` on both judgment records.
+    let path = opened.engine.session().path().to_path_buf();
+    let recs = records(&path);
+    let after = recs
+        .iter()
+        .find(|r| r["type"] == "judgment" && r["event"] == "tool_after")
+        .unwrap();
+    assert_eq!(after["fired"]["outcome"], "note");
+    let end = recs
+        .iter()
+        .find(|r| r["type"] == "judgment" && r["event"] == "turn_end")
+        .unwrap();
+    assert_eq!(end["fired"]["claim"], "warn");
+
+    // `/judgments` summary reflects the session calls and fired counts.
+    let summary = runtime.judgments_note();
+    assert!(summary.contains("2/500 calls"), "{summary}");
+    assert!(
+        summary.contains("note=1") && summary.contains("warn=1"),
+        "{summary}"
+    );
+}
+
+#[tokio::test]
+async fn approval_act_in_ask_mode_skips_safe_call_without_grant_and_asks_on_risky_call() {
+    // Repeat the exact same command on c2 so that if c1 had created a
+    // session grant, c2 would have been allowed without asking.
+    let bed = Bed::start(vec![
+        tool_turn("c1", "bash", json!({"command": "echo safe"})),
+        tool_turn("c2", "bash", json!({"command": "echo safe"})),
+        text_turn("done"),
+    ])
+    .await;
+    bed.mock.set_judge(
+        JudgeScript::new(
+            JUDGE_MODEL,
+            BTreeMap::from([
+                (DESTRUCTIVE.to_string(), noul(0.01)),
+                (IN_SCOPE.to_string(), noul(0.95)),
+                (OUTCOME.to_string(), noul(0.05)),
+                (PROGRESS.to_string(), noul(0.05)),
+                (CLAIM.to_string(), noul(0.05)),
+            ]),
+        )
+        .with_sequence(vec![
+            // First tool_before: safe + in scope -> auto-allow without asking.
+            BTreeMap::from([
+                (DESTRUCTIVE.to_string(), noul(0.02)),
+                (IN_SCOPE.to_string(), noul(0.95)),
+            ]),
+            // Second tool_before: destructive -> must ask user.
+            BTreeMap::from([
+                (DESTRUCTIVE.to_string(), noul(0.85)),
+                (IN_SCOPE.to_string(), noul(0.90)),
+            ]),
+        ]),
+    );
+    let mut judgments = Judgments::new(JUDGE);
+    judgments.checks = config::Checks::uniform(CheckAction::Off);
+    judgments.checks.set(Check::Approval, CheckAction::Act);
+    let runtime =
+        Runtime::new(bed.judged_at(ApprovalMode::Ask, judgments, &bed.mock.url(), true)).unwrap();
+
+    struct CountingApprover {
+        asked: Vec<String>,
+        answers: VecDeque<ApprovalAnswer>,
+    }
+    impl Approver for CountingApprover {
+        fn approve<'a>(
+            &'a mut self,
+            tool: &'a str,
+            _input: &'a Value,
+        ) -> BoxFuture<'a, ApprovalAnswer> {
+            self.asked.push(tool.to_string());
+            let answer = self.answers.pop_front().unwrap_or(ApprovalAnswer::Deny);
+            Box::pin(std::future::ready(answer))
+        }
+    }
+
+    let settings = SessionSettings::from_config(runtime.config());
+    let mut opened = runtime
+        .open(&Resume::Fresh, &settings, "echo safe")
+        .unwrap();
+    let mut approver = CountingApprover {
+        asked: Vec::new(),
+        answers: VecDeque::from([ApprovalAnswer::Deny]),
+    };
+    let events = Mutex::new(Vec::new());
+    let sink = |event: EngineEvent<'_>| {
+        if let EngineEvent::Judgment {
+            call_id,
+            source,
+            action,
+            ..
+        } = event
+        {
+            events.lock().unwrap().push((
+                call_id.map(str::to_string),
+                source.to_string(),
+                action.to_string(),
+            ));
+        }
+    };
+    let outcome = opened
+        .engine
+        .user_turn("echo safe".into(), &sink, &mut approver)
+        .await
+        .unwrap();
+    assert_eq!(outcome, TurnOutcome::Completed);
+    runtime.settle().await;
+
+    // Only the second call asked the user; the first ran with `answer: "judge"`
+    // and created no session grant.
+    assert_eq!(approver.asked, vec!["bash"]);
+    let path = opened.engine.session().path().to_path_buf();
+    let recs = records(&path);
+    let approvals: Vec<&Value> = recs.iter().filter(|r| r["type"] == "approval").collect();
+    assert_eq!(approvals.len(), 2);
+    assert_eq!(approvals[0]["decision"], "allow");
+    assert_eq!(approvals[0]["answer"], "judge");
+    assert_eq!(approvals[1]["decision"], "ask_user");
+    assert_eq!(approvals[1]["answer"], "deny");
+
+    // Concern emitted on the second call.
+    let events = events.into_inner().unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|(id, src, act)| id.as_deref() == Some("c2")
+                && src == "approval"
+                && act == "warn"),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn approval_act_in_auto_mode_escalates_destructive_call_and_read_only_never_allows() {
+    // 1. Auto mode with NoPrompt refuses a destructive call and includes the reason.
+    let bed = Bed::start(vec![
+        tool_turn("c1", "bash", json!({"command": "rm -rf /tmp/data"})),
+        text_turn("refused"),
+    ])
+    .await;
+    bed.mock.set_judge(judge_script(0.92, 0.95));
+    let mut judgments = Judgments::new(JUDGE);
+    judgments.checks = config::Checks::uniform(CheckAction::Off);
+    judgments.checks.set(Check::Approval, CheckAction::Act);
+    let runtime =
+        Runtime::new(bed.judged_at(ApprovalMode::Auto, judgments.clone(), &bed.mock.url(), true))
+            .unwrap();
+    let settings = SessionSettings::from_config(runtime.config());
+    let mut opened = runtime.open(&Resume::Fresh, &settings, "clean").unwrap();
+    let noop = |_: EngineEvent<'_>| {};
+    opened
+        .engine
+        .user_turn("clean".into(), &noop, &mut demerzel_core::NoPrompt)
+        .await
+        .unwrap();
+    runtime.settle().await;
+    let ContentBlock::ToolResult {
+        content, is_error, ..
+    } = &opened.engine.history()[2].content[0]
+    else {
+        panic!("expected tool result");
+    };
+    assert!(*is_error);
+    assert!(content.contains("destructive"), "{content}");
+
+    // 2. ReadOnly mode refuses writes before any judgment even when judge rates safe.
+    let bed2 = Bed::start(vec![
+        tool_turn("c1", "bash", json!({"command": "echo hi"})),
+        text_turn("refused"),
+    ])
+    .await;
+    bed2.mock.set_judge(judge_script(0.0, 1.0));
+    let runtime2 =
+        Runtime::new(bed2.judged_at(ApprovalMode::ReadOnly, judgments, &bed2.mock.url(), true))
+            .unwrap();
+    let settings2 = SessionSettings::from_config(runtime2.config());
+    let mut opened2 = runtime2.open(&Resume::Fresh, &settings2, "hi").unwrap();
+    let noop = |_: EngineEvent<'_>| {};
+    opened2
+        .engine
+        .user_turn("hi".into(), &noop, &mut demerzel_core::NoPrompt)
+        .await
+        .unwrap();
+    runtime2.settle().await;
+    assert_eq!(bed2.judge_requests().len(), 0);
+    let ContentBlock::ToolResult { is_error, .. } = &opened2.engine.history()[2].content[0] else {
+        panic!("expected tool result");
+    };
+    assert!(*is_error);
+}
+
+#[tokio::test]
+async fn plain_language_rule_denies_before_approval_and_records_both() {
+    let bed = Bed::start(vec![
+        tool_turn("c1", "bash", json!({"command": "touch src/auth/x"})),
+        text_turn("stopped"),
+    ])
+    .await;
+    bed.mock.set_judge(JudgeScript::new(
+        JUDGE_MODEL,
+        BTreeMap::from([
+            (DESTRUCTIVE.to_string(), noul(0.01)),
+            (IN_SCOPE.to_string(), noul(0.99)),
+            ("rule.0".to_string(), noul(0.95)),
+            (CLAIM.to_string(), noul(0.05)),
+        ]),
+    ));
+    let mut judgments = Judgments::new(JUDGE);
+    judgments.checks = config::Checks::uniform(CheckAction::Off);
+    judgments.checks.set(Check::Approval, CheckAction::Act);
+    let mut rule = config::Rule::new(
+        config::RuleEvent::ToolBefore,
+        "Does this command change files under src/auth/?",
+        config::RuleAction::Deny,
+        config::Origin::Project,
+    );
+    rule.tool = Some("bash".into());
+    rule.reason = "src/auth/ is off limits in this repository.".into();
+    judgments.rules.push(rule);
+    let runtime =
+        Runtime::new(bed.judged_at(ApprovalMode::Ask, judgments, &bed.mock.url(), true)).unwrap();
+    let settings = SessionSettings::from_config(runtime.config());
+    let mut opened = runtime
+        .open(&Resume::Fresh, &settings, "touch auth")
+        .unwrap();
+    let noop = |_: EngineEvent<'_>| {};
+    opened
+        .engine
+        .user_turn("touch auth".into(), &noop, &mut demerzel_core::NoPrompt)
+        .await
+        .unwrap();
+    runtime.settle().await;
+
+    // Even though approval check rated safe (0.01 / 0.99), the rule denial won.
+    let ContentBlock::ToolResult {
+        content, is_error, ..
+    } = &opened.engine.history()[2].content[0]
+    else {
+        panic!("expected tool result");
+    };
+    assert!(*is_error);
+    assert_eq!(content, "src/auth/ is off limits in this repository.");
+
+    let recs = records(opened.engine.session().path());
+    let approval = recs.iter().find(|r| r["type"] == "approval").unwrap();
+    assert_eq!(approval["decision"], "deny");
+    assert_eq!(approval["answer"], "judge");
+    let judgment = recs
+        .iter()
+        .find(|r| r["type"] == "judgment" && r["event"] == "tool_before")
+        .unwrap();
+    assert_eq!(judgment["rules"]["rule.0"]["action"], "deny");
+    assert_eq!(judgment["rules"]["rule.0"]["source"], "project");
+    assert_eq!(judgment["fired"]["rule.0"], "deny");
+    // Approval did not fire after the rule denied.
+    assert!(judgment["fired"].get("approval").is_none());
+}
+
+#[tokio::test]
+async fn timeout_leaves_policy_decision_unchanged_and_notifies_above_log() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let silent_url = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            std::thread::spawn(move || {
+                use std::io::Read as _;
+                let mut stream = stream;
+                let mut buf = [0u8; 4096];
+                while matches!(stream.read(&mut buf), Ok(n) if n > 0) {}
+            });
+        }
+    });
+
+    let bed = Bed::start(vec![
+        tool_turn("c1", "bash", json!({"command": "echo still-runs"})),
+        text_turn("done"),
+    ])
+    .await;
+    let mut judgments = Judgments::new(JUDGE);
+    judgments.checks = config::Checks::uniform(CheckAction::Off);
+    judgments.checks.set(Check::Approval, CheckAction::Act);
+    let runtime =
+        Runtime::new(bed.judged_at(ApprovalMode::Auto, judgments, &silent_url, true)).unwrap();
+    let settings = SessionSettings::from_config(runtime.config());
+    let mut opened = runtime.open(&Resume::Fresh, &settings, "go").unwrap();
+    let noop = |_: EngineEvent<'_>| {};
+    opened
+        .engine
+        .user_turn("go".into(), &noop, &mut demerzel_core::NoPrompt)
+        .await
+        .unwrap();
+    runtime.settle().await;
+    // Policy was Auto -> Allow; timeout left the call allowed.
+    let ContentBlock::ToolResult {
+        content, is_error, ..
+    } = &opened.engine.history()[2].content[0]
+    else {
+        panic!("expected tool result");
+    };
+    assert!(!*is_error);
+    assert!(content.contains("still-runs"), "{content}");
+    let notices = runtime.take_notices();
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert!(notices[0].contains("timeout"), "{notices:?}");
+}
+
+#[tokio::test]
+async fn tool_after_warn_runs_asynchronously_and_emits_judgment_event() {
+    let bed = Bed::start(vec![
+        tool_turn("c1", "bash", json!({"command": "echo fake-ok"})),
+        text_turn("all good"),
+    ])
+    .await;
+    bed.mock.set_judge(JudgeScript::new(
+        JUDGE_MODEL,
+        BTreeMap::from([(OUTCOME.to_string(), noul(0.91))]),
+    ));
+    let mut judgments = Judgments::new(JUDGE);
+    judgments.checks = config::Checks::uniform(CheckAction::Off);
+    judgments.checks.set(Check::Outcome, CheckAction::Warn);
+    let runtime =
+        Runtime::new(bed.judged_at(ApprovalMode::Auto, judgments, &bed.mock.url(), true)).unwrap();
+    let settings = SessionSettings::from_config(runtime.config());
+    let mut opened = runtime.open(&Resume::Fresh, &settings, "check").unwrap();
+    let events = Mutex::new(Vec::new());
+    let sink = |event: EngineEvent<'_>| {
+        if let EngineEvent::Judgment {
+            call_id,
+            source,
+            action,
+            ..
+        } = event
+        {
+            events.lock().unwrap().push((
+                call_id.map(str::to_string),
+                source.to_string(),
+                action.to_string(),
+            ));
+        }
+    };
+    opened
+        .engine
+        .user_turn("check".into(), &sink, &mut demerzel_core::NoPrompt)
+        .await
+        .unwrap();
+    runtime.settle().await;
+    // Tool result itself is unchanged (`warn` does not append a note).
+    let ContentBlock::ToolResult { content, .. } = &opened.engine.history()[2].content[0] else {
+        panic!("expected tool result");
+    };
+    assert!(!content.contains("[judgment:"), "{content}");
+    let events = events.into_inner().unwrap();
+    assert_eq!(
+        events,
+        vec![(Some("c1".into()), "outcome".into(), "warn".into())]
+    );
+}
+
+#[tokio::test]
+async fn auto_mode_act_asks_interactive_approver_on_destructive_call() {
+    let bed = Bed::start(vec![
+        tool_turn("c1", "bash", json!({"command": "echo dangerous"})),
+        text_turn("done"),
+    ])
+    .await;
+    bed.mock.set_judge(judge_script(0.88, 0.95));
+    let mut judgments = Judgments::new(JUDGE);
+    judgments.checks = config::Checks::uniform(CheckAction::Off);
+    judgments.checks.set(Check::Approval, CheckAction::Act);
+    let runtime =
+        Runtime::new(bed.judged_at(ApprovalMode::Auto, judgments, &bed.mock.url(), true)).unwrap();
+
+    struct AskOnce {
+        asked: Vec<String>,
+    }
+    impl Approver for AskOnce {
+        fn approve<'a>(
+            &'a mut self,
+            tool: &'a str,
+            _input: &'a Value,
+        ) -> BoxFuture<'a, ApprovalAnswer> {
+            self.asked.push(tool.to_string());
+            Box::pin(std::future::ready(ApprovalAnswer::Allow))
+        }
+    }
+
+    let settings = SessionSettings::from_config(runtime.config());
+    let mut opened = runtime.open(&Resume::Fresh, &settings, "run").unwrap();
+    let mut approver = AskOnce { asked: Vec::new() };
+    let noop = |_: EngineEvent<'_>| {};
+    opened
+        .engine
+        .user_turn("run".into(), &noop, &mut approver)
+        .await
+        .unwrap();
+    runtime.settle().await;
+    assert_eq!(approver.asked, vec!["bash"]);
+    let ContentBlock::ToolResult {
+        content, is_error, ..
+    } = &opened.engine.history()[2].content[0]
+    else {
+        panic!("expected tool result");
+    };
+    assert!(!*is_error);
+    assert!(content.contains("dangerous"), "{content}");
+}
+
+#[tokio::test]
+async fn tool_before_rule_can_deny_read_only_tool_and_new_resets_judgments_summary() {
+    let bed = Bed::start(vec![
+        tool_turn("c1", "read", json!({"path": "secret.env"})),
+        text_turn("denied"),
+    ])
+    .await;
+    std::fs::write(bed.project.path().join("secret.env"), "SECRET=1\n").unwrap();
+    bed.mock.set_judge(JudgeScript::new(
+        JUDGE_MODEL,
+        BTreeMap::from([("rule.0".to_string(), noul(0.95))]),
+    ));
+    let mut judgments = Judgments::new(JUDGE);
+    judgments.checks = config::Checks::uniform(CheckAction::Off);
+    let mut rule = config::Rule::new(
+        config::RuleEvent::ToolBefore,
+        "Does this read touch a .env file?",
+        config::RuleAction::Deny,
+        config::Origin::Project,
+    );
+    rule.tool = Some("read".into());
+    rule.reason = "reading .env files is blocked.".into();
+    judgments.rules.push(rule);
+    let runtime =
+        Runtime::new(bed.judged_at(ApprovalMode::Ask, judgments, &bed.mock.url(), true)).unwrap();
+    let settings = SessionSettings::from_config(runtime.config());
+    let mut opened = runtime
+        .open(&Resume::Fresh, &settings, "read secret.env")
+        .unwrap();
+    let noop = |_: EngineEvent<'_>| {};
+    opened
+        .engine
+        .user_turn(
+            "read secret.env".into(),
+            &noop,
+            &mut demerzel_core::NoPrompt,
+        )
+        .await
+        .unwrap();
+    runtime.settle().await;
+    let ContentBlock::ToolResult {
+        content, is_error, ..
+    } = &opened.engine.history()[2].content[0]
+    else {
+        panic!("expected tool result");
+    };
+    assert!(*is_error);
+    assert_eq!(content, "reading .env files is blocked.");
+
+    let before_new = runtime.judgments_note();
+    assert!(before_new.contains("1/500 calls"), "{before_new}");
+    assert!(before_new.contains("deny=1"), "{before_new}");
+    let _fresh = runtime.open(&Resume::Fresh, &settings, "next").unwrap();
+    let after_new = runtime.judgments_note();
+    assert!(after_new.contains("0/500 calls"), "{after_new}");
 }

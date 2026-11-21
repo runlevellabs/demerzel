@@ -549,6 +549,10 @@ pub struct Transcript {
     /// Tool call id to the absolute index of its card, kept so an
     /// unanswered call can close as interrupted.
     tools: HashMap<String, usize>,
+    /// Recently finished tool calls (`(id, absolute_index)`), bounded,
+    /// so an async `tool_after` judgment finding can attach to its
+    /// card after `tool_end`.
+    ended_tools: VecDeque<(String, usize)>,
     /// The absolute index of the card between its dispatch and its
     /// result: the one an approval question is about.
     running: Option<usize>,
@@ -595,6 +599,7 @@ impl Transcript {
             dropped: 0,
             open: None,
             tools: HashMap::new(),
+            ended_tools: VecDeque::new(),
             running: None,
             expanded: false,
             thinking: Thinking::default(),
@@ -793,18 +798,51 @@ impl Transcript {
         if index.is_some() && self.running == index {
             self.running = None;
         }
-        match index.and_then(|index| self.card_at(index).map(|card| (index, card))) {
-            Some((index, card)) => {
-                card.end(outcome);
-                self.touch(index);
-            }
-            None => {
-                let mut card = Card::new(name, self.expanded);
-                card.end(outcome);
-                self.open = None;
-                self.push_block(Block::card(card));
-            }
+        let ended_index =
+            match index.and_then(|index| self.card_at(index).map(|card| (index, card))) {
+                Some((index, card)) => {
+                    card.end(outcome);
+                    self.touch(index);
+                    index
+                }
+                None => {
+                    let mut card = Card::new(name, self.expanded);
+                    card.end(outcome);
+                    self.open = None;
+                    self.push_block(Block::card(card));
+                    self.dropped + self.blocks.len() - 1
+                }
+            };
+        if self.ended_tools.len() >= 64 {
+            self.ended_tools.pop_front();
         }
+        self.ended_tools.push_back((id.to_string(), ended_index));
+    }
+
+    /// Attach a judgment finding to its tool card when `call_id` names
+    /// a live or recently finished card; otherwise append a notice
+    /// line (for example a `turn_end` finding).
+    pub fn tool_judgment(&mut self, call_id: Option<&str>, source: &str, action: &str, text: &str) {
+        let index = call_id.and_then(|id| {
+            self.tools.get(id).copied().or_else(|| {
+                self.ended_tools
+                    .iter()
+                    .rev()
+                    .find(|(ended_id, _)| ended_id == id)
+                    .map(|&(_, index)| index)
+            })
+        });
+        if let Some(index) = index
+            && let Some(card) = self.card_at(index)
+        {
+            card.add_judgment(source, action, text);
+            self.touch(index);
+            return;
+        }
+        self.push_line(
+            Kind::Notice,
+            &format!("! judgment ({source}, {action}): {text}"),
+        );
     }
 
     /// Show a resumed session's past turns as blocks: the replay on
@@ -819,6 +857,7 @@ impl Transcript {
         // open would keep an index the replay moves past. At the
         // quiet point the driver uses, this closes nothing.
         self.close();
+        self.ended_tools.clear();
         self.blocks.reserve(replay.entries.len().min(MAX_BLOCKS));
         let now = Instant::now();
         if replay.left_out > 0 {
@@ -2555,5 +2594,42 @@ mod tests {
         // Follow mode ignores the height.
         frame(&mut t, 20, 4);
         assert_eq!(t.scroll(), 0);
+    }
+
+    #[test]
+    fn judgment_findings_attach_to_live_and_ended_cards_or_fall_back_to_notice() {
+        let mut t = plain();
+        let now = Instant::now();
+        t.tool_start("c1", "bash");
+        t.tool_run("c1", now);
+        t.tool_judgment(Some("c1"), "approval", "warn", "destructive");
+        t.tool_end(
+            "c1",
+            "bash",
+            Outcome {
+                summary: Some("bash: exit 0"),
+                is_error: false,
+                output: "ok".into(),
+                output_cut: false,
+                at: now,
+            },
+        );
+        // Late async tool_after warn still attaches to the ended card.
+        t.tool_judgment(Some("c1"), "outcome", "warn", "may have failed");
+        // Turn-end finding with no call_id becomes a notice block.
+        t.tool_judgment(None, "claim", "warn", "unsupported claim");
+        frame(&mut t, 80, 20);
+        let rendered: Vec<&str> = t.blocks().map(Block::text).collect();
+        assert!(
+            rendered[0].contains("! approval (warn): destructive")
+                && rendered[0].contains("! outcome (warn): may have failed"),
+            "{rendered:?}"
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|text| text.contains("! judgment (claim, warn): unsupported claim")),
+            "{rendered:?}"
+        );
     }
 }

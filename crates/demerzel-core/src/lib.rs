@@ -21,8 +21,8 @@ pub use engine::{
     EngineError, EngineEvent, EngineParts, EventSink, NoPrompt, TurnOutcome,
 };
 pub use host::{
-    CallSeen, HostReply, LoopHost, ToolAfter, ToolBefore, ToolGate, TurnEnd, TurnEndOutcome,
-    TurnStart, TurnView,
+    CallSeen, Finding, HostReply, LoopHost, ToolAfter, ToolBefore, ToolGate, TurnEnd,
+    TurnEndOutcome, TurnStart, TurnView,
 };
 pub use judge::{
     Answer, Judge, JudgeError, JudgeReply, JudgeRequest, JudgeUsage, Question, check_reply,
@@ -33,7 +33,7 @@ pub use provider::{
 };
 pub use route::{ProviderHost, Route, SingleProvider, Target};
 pub use session::{
-    JudgmentRecord, Replay, ReplayToolClock, ReplayUsage, SCHEMA_VERSION, Session, SessionMeta,
-    SessionOpen, SessionRecord, SessionStore, SessionWriter, Timing, replay,
+    JudgmentRecord, JudgmentRuleRecord, Replay, ReplayToolClock, ReplayUsage, SCHEMA_VERSION,
+    Session, SessionMeta, SessionOpen, SessionRecord, SessionStore, SessionWriter, Timing, replay,
 };
 pub use tool::{BoxFuture, ToolDefinition, ToolHost, ToolOutput};
